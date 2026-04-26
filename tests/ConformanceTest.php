@@ -133,6 +133,7 @@ foreach (
     [
         'identity/mfa/webauthn-assertion.json',
         'identity/mfa/webauthn-counter-decrease-rejected.json',
+        'identity/mfa/webauthn-assertion-algorithms.json',
     ] as $fixturePath
 ) {
     describe(

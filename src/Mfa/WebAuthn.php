@@ -23,12 +23,21 @@ final class WebAuthn
     private const FLAG_UP = 0x01;
     private const FLAG_UV = 0x04;
 
+    /** Minimum RSA modulus per ADR 0010 / WebAuthn §5.8.5. */
+    private const RSA_MIN_KEY_SIZE_BITS = 2048;
+
     /**
      * SPKI DER prefix for prime256v1 (P-256) EC public keys. The
      * remaining 64 bytes are the raw x || y coordinates appended after
      * the 0x04 (uncompressed point) byte already encoded here.
      */
     private const SPKI_P256_PREFIX_HEX = '3059301306072a8648ce3d020106082a8648ce3d03010703420004';
+
+    /**
+     * SPKI DER prefix for Ed25519 public keys per RFC 8410. The
+     * remaining 32 bytes are the raw public key.
+     */
+    private const SPKI_ED25519_PREFIX_HEX = '302a300506032b6570032100';
 
     private function __construct() {}
 
@@ -132,21 +141,47 @@ final class WebAuthn
             );
         }
 
-        // Parse COSE_Key, build SPKI DER, verify ES256 signature.
-        [$x, $y] = self::parseCoseEs256($cosePublicKey);
-        $pem = self::p256SpkiPem($x, $y);
-        $publicKey = openssl_pkey_get_public($pem);
-        if ($publicKey === false) {
-            throw new WebAuthnException('OpenSSL rejected the constructed P-256 public key', 'malformed');
-        }
-
-        if (strlen($signature) < 8 || $signature[0] !== "\x30") {
-            throw new WebAuthnException('Signature is not a DER ECDSA structure', 'signature_invalid');
-        }
-
+        // Algorithm dispatch per ADR 0010: COSE_Key.alg picks the verifier.
+        $cose = self::parseCoseKey($cosePublicKey);
         $clientHash = hash('sha256', $clientDataJson, true);
         $signed = $authenticatorData . $clientHash;
-        $result = openssl_verify($signed, $signature, $publicKey, OPENSSL_ALGO_SHA256);
+
+        if ($cose['alg'] === -7) {
+            $pem = self::p256SpkiPem($cose['x'], $cose['y']);
+            $publicKey = openssl_pkey_get_public($pem);
+            if ($publicKey === false) {
+                throw new WebAuthnException('OpenSSL rejected the constructed P-256 public key', 'malformed');
+            }
+            if (strlen($signature) < 8 || $signature[0] !== "\x30") {
+                throw new WebAuthnException('Signature is not a DER ECDSA structure', 'signature_invalid');
+            }
+            $result = openssl_verify($signed, $signature, $publicKey, OPENSSL_ALGO_SHA256);
+        } elseif ($cose['alg'] === -257) {
+            $pem = self::rsaSpkiPem($cose['n'], $cose['e']);
+            $publicKey = openssl_pkey_get_public($pem);
+            if ($publicKey === false) {
+                throw new WebAuthnException('OpenSSL rejected the constructed RSA public key', 'malformed');
+            }
+            $result = openssl_verify($signed, $signature, $publicKey, OPENSSL_ALGO_SHA256);
+        } elseif ($cose['alg'] === -8) {
+            if (strlen($signature) !== 64) {
+                throw new WebAuthnException(
+                    'Ed25519 signature must be 64 bytes, got ' . strlen($signature),
+                    'signature_invalid',
+                );
+            }
+            // ext/sodium ships Ed25519 verification; openssl_verify gained
+            // EdDSA only via OpenSSL 1.1.1+ raw mode. Sodium is the
+            // portable bet across PHP 8.3 distributions.
+            $ok = sodium_crypto_sign_verify_detached($signature, $signed, $cose['x']);
+            $result = $ok ? 1 : 0;
+        } else {
+            throw new WebAuthnException(
+                'Unsupported alg dispatch: ' . var_export($cose['alg'], true),
+                'unsupported_key',
+            );
+        }
+
         if ($result !== 1) {
             throw new WebAuthnException(
                 $result === -1
@@ -177,11 +212,14 @@ final class WebAuthn
     }
 
     /**
-     * @return array{0: string, 1: string} [x, y] each 32 bytes.
+     * Parse a COSE_Key for any v0.2-supported algorithm. Returns a
+     * shape-discriminated array keyed by `alg`.
+     *
+     * @return array{alg:int, x?:string, y?:string, n?:string, e?:string}
      *
      * @throws WebAuthnException
      */
-    private static function parseCoseEs256(string $coseKey): array
+    private static function parseCoseKey(string $coseKey): array
     {
         $cursor = 0;
         $value = self::cborDecodeItem($coseKey, $cursor);
@@ -193,25 +231,81 @@ final class WebAuthn
         }
         $kty = $value[1] ?? null;
         $alg = $value[3] ?? null;
-        $crv = $value[-1] ?? null;
-        $x = $value[-2] ?? null;
-        $y = $value[-3] ?? null;
-        if ($kty !== 2) {
-            throw new WebAuthnException('Unsupported COSE kty: ' . var_export($kty, true), 'unsupported_key');
+
+        if ($alg === -7) {
+            if ($kty !== 2) {
+                throw new WebAuthnException('ES256 requires COSE kty=2, got ' . var_export($kty, true), 'unsupported_key');
+            }
+            $crv = $value[-1] ?? null;
+            $x = $value[-2] ?? null;
+            $y = $value[-3] ?? null;
+            if ($crv !== 1) {
+                throw new WebAuthnException('ES256 requires crv=1, got ' . var_export($crv, true), 'unsupported_key');
+            }
+            if (!is_string($x) || strlen($x) !== 32) {
+                throw new WebAuthnException('COSE x coordinate must be 32 bytes', 'malformed');
+            }
+            if (!is_string($y) || strlen($y) !== 32) {
+                throw new WebAuthnException('COSE y coordinate must be 32 bytes', 'malformed');
+            }
+            return ['alg' => -7, 'x' => $x, 'y' => $y];
         }
-        if ($alg !== -7) {
-            throw new WebAuthnException('Unsupported COSE alg: ' . var_export($alg, true), 'unsupported_key');
+        if ($alg === -257) {
+            if ($kty !== 3) {
+                throw new WebAuthnException('RS256 requires COSE kty=3, got ' . var_export($kty, true), 'unsupported_key');
+            }
+            $n = $value[-1] ?? null;
+            $e = $value[-2] ?? null;
+            if (!is_string($n)) {
+                throw new WebAuthnException('COSE RSA modulus (n) must be a byte string', 'malformed');
+            }
+            if (!is_string($e)) {
+                throw new WebAuthnException('COSE RSA exponent (e) must be a byte string', 'malformed');
+            }
+            // Compute bit-length of the modulus, ignoring leading zero bytes
+            // (CBOR byte-string is unsigned big-endian; a leading 0x00 may
+            // appear to disambiguate the high bit).
+            $nTrimmed = ltrim($n, "\x00");
+            if ($nTrimmed === '') {
+                $nTrimmed = "\x00";
+            }
+            $msb = ord($nTrimmed[0]);
+            $bits = (strlen($nTrimmed) - 1) * 8;
+            for ($mask = 0x80; $mask > 0; $mask >>= 1) {
+                if (($msb & $mask) !== 0) {
+                    $bits += 1 + (int) log($mask, 2);
+                    break;
+                }
+            }
+            if ($bits < self::RSA_MIN_KEY_SIZE_BITS) {
+                throw new WebAuthnException(
+                    "RSA key {$bits}-bit is below the " . self::RSA_MIN_KEY_SIZE_BITS . '-bit floor',
+                    'unsupported_key',
+                );
+            }
+            return ['alg' => -257, 'n' => $nTrimmed, 'e' => ltrim($e, "\x00") ?: "\x00"];
         }
-        if ($crv !== 1) {
-            throw new WebAuthnException('Unsupported COSE crv: ' . var_export($crv, true), 'unsupported_key');
+        if ($alg === -8) {
+            if ($kty !== 1) {
+                throw new WebAuthnException('EdDSA requires COSE kty=1, got ' . var_export($kty, true), 'unsupported_key');
+            }
+            $crv = $value[-1] ?? null;
+            $x = $value[-2] ?? null;
+            if ($crv !== 6) {
+                throw new WebAuthnException(
+                    'v0.2 EdDSA accepts only Ed25519 (crv=6), got crv=' . var_export($crv, true),
+                    'unsupported_key',
+                );
+            }
+            if (!is_string($x) || strlen($x) !== 32) {
+                throw new WebAuthnException('Ed25519 public key must be 32 bytes', 'malformed');
+            }
+            return ['alg' => -8, 'x' => $x];
         }
-        if (!is_string($x) || strlen($x) !== 32) {
-            throw new WebAuthnException('COSE x coordinate must be 32 bytes', 'malformed');
-        }
-        if (!is_string($y) || strlen($y) !== 32) {
-            throw new WebAuthnException('COSE y coordinate must be 32 bytes', 'malformed');
-        }
-        return [$x, $y];
+        throw new WebAuthnException(
+            'Unsupported COSE alg: ' . var_export($alg, true) . ' (kty=' . var_export($kty, true) . ')',
+            'unsupported_key',
+        );
     }
 
     /**
@@ -299,6 +393,54 @@ final class WebAuthn
         $der = hex2bin(self::SPKI_P256_PREFIX_HEX) . $x . $y;
         $b64 = chunk_split(base64_encode($der), 64, "\n");
         return "-----BEGIN PUBLIC KEY-----\n{$b64}-----END PUBLIC KEY-----\n";
+    }
+
+    /**
+     * Build a PEM-encoded SubjectPublicKeyInfo for an RSA public key
+     * given the raw modulus (n) and exponent (e) bytes (big-endian,
+     * leading-zero-stripped).
+     */
+    private static function rsaSpkiPem(string $n, string $e): string
+    {
+        $rsaPubDer = self::derSequence(
+            self::derInteger($n) . self::derInteger($e)
+        );
+        // SubjectPublicKeyInfo: SEQUENCE { AlgorithmIdentifier (rsaEncryption), BIT STRING (rsaPublicKey) }
+        // AlgorithmIdentifier: SEQUENCE { OID 1.2.840.113549.1.1.1, NULL }
+        $algId = hex2bin('300d06092a864886f70d0101010500');
+        $bitString = "\x03" . self::derLength(strlen($rsaPubDer) + 1) . "\x00" . $rsaPubDer;
+        $spki = self::derSequence($algId . $bitString);
+        $b64 = chunk_split(base64_encode($spki), 64, "\n");
+        return "-----BEGIN PUBLIC KEY-----\n{$b64}-----END PUBLIC KEY-----\n";
+    }
+
+    /** DER INTEGER from a positive big-endian unsigned byte string. */
+    private static function derInteger(string $bytes): string
+    {
+        // ASN.1 INTEGER is signed; if MSB is set, prepend 0x00 to keep positive.
+        if ($bytes !== '' && (ord($bytes[0]) & 0x80) !== 0) {
+            $bytes = "\x00" . $bytes;
+        }
+        return "\x02" . self::derLength(strlen($bytes)) . $bytes;
+    }
+
+    private static function derSequence(string $contents): string
+    {
+        return "\x30" . self::derLength(strlen($contents)) . $contents;
+    }
+
+    private static function derLength(int $n): string
+    {
+        if ($n < 128) {
+            return chr($n);
+        }
+        $bytes = '';
+        $tmp = $n;
+        while ($tmp > 0) {
+            $bytes = chr($tmp & 0xFF) . $bytes;
+            $tmp >>= 8;
+        }
+        return chr(0x80 | strlen($bytes)) . $bytes;
     }
 
     /**
