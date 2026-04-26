@@ -65,6 +65,15 @@ final class Totp
         string $algorithm = self::DEFAULT_ALGORITHM,
         int $driftWindows = 1,
     ): bool {
+        if ($driftWindows < 0 || $driftWindows > 10) {
+            // Cap the verifier search radius. Each window adds one HMAC
+            // computation, so unbounded values amount to a CPU-exhaustion
+            // primitive. The default ±1 covers normal clock skew; ±10 is
+            // the operational ceiling.
+            throw new \InvalidArgumentException(
+                "driftWindows must be 0..10, got {$driftWindows}",
+            );
+        }
         if ($timestamp === null) {
             $timestamp = time();
         }
