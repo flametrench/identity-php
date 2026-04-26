@@ -19,6 +19,8 @@
 
 declare(strict_types=1);
 
+use Flametrench\Identity\Mfa\RecoveryCodes;
+use Flametrench\Identity\Mfa\Totp;
 use Flametrench\Identity\PasswordHashing;
 
 const IDENTITY_FIXTURES_DIR = __DIR__ . '/conformance/fixtures';
@@ -53,6 +55,41 @@ describe(
                     $t['input']['candidate_password'],
                 );
                 expect($result)->toBe($t['expected']['result']);
+            });
+        }
+    },
+);
+
+// ─── v0.2: identity.totp_compute (RFC 6238) ───
+
+describe(
+    'Conformance · identity.totp_compute [MUST] · RFC 6238',
+    function () {
+        $fixture = loadIdentityFixture('identity/mfa/totp-rfc6238.json');
+        foreach ($fixture['tests'] as $t) {
+            it("[{$t['id']}] {$t['description']}", function () use ($t) {
+                $result = Totp::compute(
+                    secret: $t['input']['secret_ascii'],
+                    timestamp: $t['input']['timestamp'],
+                    digits: $t['input']['digits'],
+                    algorithm: $t['input']['algorithm'],
+                );
+                expect($result)->toBe($t['expected']['result']);
+            });
+        }
+    },
+);
+
+// ─── v0.2: identity.generate_recovery_code (format predicate) ───
+
+describe(
+    'Conformance · identity.generate_recovery_code [MUST] · format',
+    function () {
+        $fixture = loadIdentityFixture('identity/mfa/recovery-code-format.json');
+        foreach ($fixture['tests'] as $t) {
+            it("[{$t['id']}] {$t['description']}", function () use ($t) {
+                expect(RecoveryCodes::isValid($t['input']['code']))
+                    ->toBe($t['expected']['result']);
             });
         }
     },
