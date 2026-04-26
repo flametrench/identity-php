@@ -9,7 +9,7 @@ namespace Flametrench\Identity\Exceptions;
 
 final class PreconditionException extends IdentityException
 {
-    public function __construct(string $message, string $specifics)
+    public function __construct(string $message, public readonly string $specifics)
     {
         parent::__construct($message, "precondition.{$specifics}");
     }

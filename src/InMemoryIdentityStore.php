@@ -645,4 +645,430 @@ final class InMemoryIdentityStore implements IdentityStore
         }
         return $updated;
     }
+
+    // ─── v0.2 MFA store operations (ADR 0008) ───
+
+    /** Pending TOTP/WebAuthn factor TTL per ADR 0008 (10 minutes). */
+    public const PENDING_FACTOR_TTL_SECONDS = 600;
+
+    /** @var array<string, Mfa\TotpFactor|Mfa\WebAuthnFactor|Mfa\RecoveryFactor> */
+    private array $mfaFactors = [];
+    /** @var array<string, string> mfaId → raw secret bytes */
+    private array $mfaTotpSecrets = [];
+    /** @var array<string, string> mfaId → COSE pubkey bytes */
+    private array $mfaWebauthnKeys = [];
+    /** @var array<string, list<string>> mfaId → 10 PHC hashes */
+    private array $mfaRecoveryHashes = [];
+    /** @var array<string, list<bool>> parallel array of consumed flags */
+    private array $mfaRecoveryConsumed = [];
+    /** @var array<string, string> "{usrId}|{type}" → mfaId (totp + recovery only) */
+    private array $mfaActiveSingleton = [];
+    /** @var array<string, string> credential_id → mfaId (active webauthn) */
+    private array $mfaWebauthnByCredentialId = [];
+    /** @var array<string, Mfa\UserMfaPolicy> */
+    private array $mfaPolicies = [];
+
+    public function enrollTotpFactor(string $usrId, string $identifier): array
+    {
+        $this->checkUserActive($usrId);
+        $this->enforceNoActiveSingleton($usrId, 'totp');
+        $now = $this->now();
+        $secret = Mfa\Totp::generateSecret();
+        $mfaId = Id::generate('mfa');
+        $factor = new Mfa\TotpFactor(
+            id: $mfaId,
+            usrId: $usrId,
+            identifier: $identifier,
+            status: Mfa\FactorStatus::Pending,
+            replaces: null,
+            createdAt: $now,
+            updatedAt: $now,
+        );
+        $this->mfaFactors[$mfaId] = $factor;
+        $this->mfaTotpSecrets[$mfaId] = $secret;
+        $secretB32 = rtrim(self::base32Encode($secret), '=');
+        $otpauthUri = Mfa\Totp::otpauthUri($secret, $identifier, 'Flametrench');
+        return ['factor' => $factor, 'secretB32' => $secretB32, 'otpauthUri' => $otpauthUri];
+    }
+
+    public function enrollWebAuthnFactor(
+        string $usrId,
+        string $identifier,
+        string $publicKey,
+        int $signCount,
+        string $rpId,
+        ?string $aaguid = null,
+        ?array $transports = null,
+    ): array {
+        $this->checkUserActive($usrId);
+        if (isset($this->mfaWebauthnByCredentialId[$identifier])) {
+            throw new Exceptions\PreconditionException(
+                "WebAuthn credential '{$identifier}' is already enrolled",
+                'duplicate_webauthn_credential',
+            );
+        }
+        $now = $this->now();
+        $mfaId = Id::generate('mfa');
+        $factor = new Mfa\WebAuthnFactor(
+            id: $mfaId,
+            usrId: $usrId,
+            identifier: $identifier,
+            status: Mfa\FactorStatus::Pending,
+            replaces: null,
+            rpId: $rpId,
+            signCount: $signCount,
+            createdAt: $now,
+            updatedAt: $now,
+        );
+        $this->mfaFactors[$mfaId] = $factor;
+        $this->mfaWebauthnKeys[$mfaId] = $publicKey;
+        $this->mfaWebauthnByCredentialId[$identifier] = $mfaId;
+        return ['factor' => $factor];
+    }
+
+    public function enrollRecoveryFactor(string $usrId): array
+    {
+        $this->checkUserActive($usrId);
+        $this->enforceNoActiveSingleton($usrId, 'recovery');
+        $now = $this->now();
+        $codes = Mfa\RecoveryCodes::generateSet();
+        $hashes = array_map(fn($c) => PasswordHashing::hash($c), $codes);
+        $consumed = array_fill(0, count($codes), false);
+        $mfaId = Id::generate('mfa');
+        $factor = new Mfa\RecoveryFactor(
+            id: $mfaId,
+            usrId: $usrId,
+            status: Mfa\FactorStatus::Active,
+            replaces: null,
+            createdAt: $now,
+            updatedAt: $now,
+            remaining: count($codes),
+        );
+        $this->mfaFactors[$mfaId] = $factor;
+        $this->mfaRecoveryHashes[$mfaId] = $hashes;
+        $this->mfaRecoveryConsumed[$mfaId] = $consumed;
+        $this->mfaActiveSingleton["{$usrId}|recovery"] = $mfaId;
+        return ['factor' => $factor, 'codes' => $codes];
+    }
+
+    public function getMfaFactor(string $mfaId): Mfa\TotpFactor|Mfa\WebAuthnFactor|Mfa\RecoveryFactor
+    {
+        return $this->requireFactor($mfaId);
+    }
+
+    public function listMfaFactors(string $usrId): array
+    {
+        return array_values(array_filter(
+            $this->mfaFactors,
+            fn($f) => $f->usrId === $usrId,
+        ));
+    }
+
+    public function confirmTotpFactor(string $mfaId, string $code): Mfa\TotpFactor
+    {
+        $factor = $this->requireFactor($mfaId);
+        if (!$factor instanceof Mfa\TotpFactor) {
+            throw new Exceptions\CredentialTypeMismatchException(
+                "Factor {$mfaId} is not totp"
+            );
+        }
+        if ($factor->status !== Mfa\FactorStatus::Pending) {
+            throw new Exceptions\PreconditionException(
+                "Factor {$mfaId} is {$factor->status->value}; only pending factors confirm",
+                'factor_not_pending',
+            );
+        }
+        $this->checkPendingNotExpired($factor);
+        $secret = $this->mfaTotpSecrets[$mfaId];
+        if (!Mfa\Totp::verify($secret, $code, $this->now()->getTimestamp())) {
+            throw new Exceptions\InvalidCredentialException('TOTP code did not verify');
+        }
+        $now = $this->now();
+        $active = new Mfa\TotpFactor(
+            id: $factor->id,
+            usrId: $factor->usrId,
+            identifier: $factor->identifier,
+            status: Mfa\FactorStatus::Active,
+            replaces: $factor->replaces,
+            createdAt: $factor->createdAt,
+            updatedAt: $now,
+        );
+        $this->mfaFactors[$mfaId] = $active;
+        $this->mfaActiveSingleton["{$factor->usrId}|totp"] = $mfaId;
+        return $active;
+    }
+
+    public function confirmWebAuthnFactor(
+        string $mfaId,
+        string $authenticatorData,
+        string $clientDataJson,
+        string $signature,
+        string $expectedChallenge,
+        string $expectedOrigin,
+    ): Mfa\WebAuthnFactor {
+        $factor = $this->requireFactor($mfaId);
+        if (!$factor instanceof Mfa\WebAuthnFactor) {
+            throw new Exceptions\CredentialTypeMismatchException(
+                "Factor {$mfaId} is not webauthn"
+            );
+        }
+        if ($factor->status !== Mfa\FactorStatus::Pending) {
+            throw new Exceptions\PreconditionException(
+                "Factor {$mfaId} is {$factor->status->value}; only pending factors confirm",
+                'factor_not_pending',
+            );
+        }
+        $this->checkPendingNotExpired($factor);
+        $result = Mfa\WebAuthn::verifyAssertion(
+            cosePublicKey: $this->mfaWebauthnKeys[$mfaId],
+            storedSignCount: $factor->signCount,
+            storedRpId: $factor->rpId,
+            expectedChallenge: $expectedChallenge,
+            expectedOrigin: $expectedOrigin,
+            authenticatorData: $authenticatorData,
+            clientDataJson: $clientDataJson,
+            signature: $signature,
+        );
+        $now = $this->now();
+        $active = new Mfa\WebAuthnFactor(
+            id: $factor->id,
+            usrId: $factor->usrId,
+            identifier: $factor->identifier,
+            status: Mfa\FactorStatus::Active,
+            replaces: $factor->replaces,
+            rpId: $factor->rpId,
+            signCount: $result->newSignCount,
+            createdAt: $factor->createdAt,
+            updatedAt: $now,
+        );
+        $this->mfaFactors[$mfaId] = $active;
+        return $active;
+    }
+
+    public function revokeMfaFactor(string $mfaId): Mfa\TotpFactor|Mfa\WebAuthnFactor|Mfa\RecoveryFactor
+    {
+        $factor = $this->requireFactor($mfaId);
+        if ($factor->status === Mfa\FactorStatus::Revoked) return $factor;
+        $now = $this->now();
+        if ($factor instanceof Mfa\TotpFactor) {
+            $revoked = new Mfa\TotpFactor(
+                id: $factor->id, usrId: $factor->usrId, identifier: $factor->identifier,
+                status: Mfa\FactorStatus::Revoked, replaces: $factor->replaces,
+                createdAt: $factor->createdAt, updatedAt: $now,
+            );
+            unset($this->mfaActiveSingleton["{$factor->usrId}|totp"]);
+        } elseif ($factor instanceof Mfa\WebAuthnFactor) {
+            $revoked = new Mfa\WebAuthnFactor(
+                id: $factor->id, usrId: $factor->usrId, identifier: $factor->identifier,
+                status: Mfa\FactorStatus::Revoked, replaces: $factor->replaces,
+                rpId: $factor->rpId, signCount: $factor->signCount,
+                createdAt: $factor->createdAt, updatedAt: $now,
+            );
+            unset($this->mfaWebauthnByCredentialId[$factor->identifier]);
+        } else {
+            $revoked = new Mfa\RecoveryFactor(
+                id: $factor->id, usrId: $factor->usrId,
+                status: Mfa\FactorStatus::Revoked, replaces: $factor->replaces,
+                createdAt: $factor->createdAt, updatedAt: $now,
+                remaining: $factor->remaining,
+            );
+            unset($this->mfaActiveSingleton["{$factor->usrId}|recovery"]);
+        }
+        $this->mfaFactors[$mfaId] = $revoked;
+        return $revoked;
+    }
+
+    public function verifyMfa(string $usrId, Mfa\MfaProof $proof): Mfa\MfaVerifyResult
+    {
+        if ($proof instanceof Mfa\TotpProof) return $this->verifyTotp($usrId, $proof->code);
+        if ($proof instanceof Mfa\WebAuthnProof) return $this->verifyWebAuthnProof($usrId, $proof);
+        if ($proof instanceof Mfa\RecoveryProof) return $this->verifyRecovery($usrId, $proof->code);
+        throw new \InvalidArgumentException('Unknown MFA proof type');
+    }
+
+    private function verifyTotp(string $usrId, string $code): Mfa\MfaVerifyResult
+    {
+        $mfaId = $this->mfaActiveSingleton["{$usrId}|totp"] ?? null;
+        if ($mfaId === null) {
+            throw new Exceptions\InvalidCredentialException('No active TOTP factor for user');
+        }
+        $secret = $this->mfaTotpSecrets[$mfaId];
+        if (!Mfa\Totp::verify($secret, $code, $this->now()->getTimestamp())) {
+            throw new Exceptions\InvalidCredentialException('TOTP code did not verify');
+        }
+        return new Mfa\MfaVerifyResult(
+            mfaId: $mfaId, type: Mfa\FactorType::Totp,
+            mfaVerifiedAt: $this->now(), newSignCount: null,
+        );
+    }
+
+    private function verifyWebAuthnProof(string $usrId, Mfa\WebAuthnProof $proof): Mfa\MfaVerifyResult
+    {
+        $mfaId = $this->mfaWebauthnByCredentialId[$proof->credentialId] ?? null;
+        if ($mfaId === null) {
+            throw new Exceptions\InvalidCredentialException('No WebAuthn factor for credential id');
+        }
+        $factor = $this->mfaFactors[$mfaId];
+        if (!$factor instanceof Mfa\WebAuthnFactor) {
+            throw new Exceptions\InvalidCredentialException('Factor is not WebAuthn');
+        }
+        if ($factor->usrId !== $usrId) {
+            throw new Exceptions\InvalidCredentialException('WebAuthn factor does not belong to user');
+        }
+        if ($factor->status !== Mfa\FactorStatus::Active) {
+            throw new Exceptions\InvalidCredentialException(
+                "WebAuthn factor is {$factor->status->value}, not active"
+            );
+        }
+        $result = Mfa\WebAuthn::verifyAssertion(
+            cosePublicKey: $this->mfaWebauthnKeys[$mfaId],
+            storedSignCount: $factor->signCount,
+            storedRpId: $factor->rpId,
+            expectedChallenge: $proof->expectedChallenge,
+            expectedOrigin: $proof->expectedOrigin,
+            authenticatorData: $proof->authenticatorData,
+            clientDataJson: $proof->clientDataJson,
+            signature: $proof->signature,
+        );
+        $now = $this->now();
+        $this->mfaFactors[$mfaId] = new Mfa\WebAuthnFactor(
+            id: $factor->id, usrId: $factor->usrId, identifier: $factor->identifier,
+            status: $factor->status, replaces: $factor->replaces,
+            rpId: $factor->rpId, signCount: $result->newSignCount,
+            createdAt: $factor->createdAt, updatedAt: $now,
+        );
+        return new Mfa\MfaVerifyResult(
+            mfaId: $mfaId, type: Mfa\FactorType::WebAuthn,
+            mfaVerifiedAt: $now, newSignCount: $result->newSignCount,
+        );
+    }
+
+    private function verifyRecovery(string $usrId, string $code): Mfa\MfaVerifyResult
+    {
+        $mfaId = $this->mfaActiveSingleton["{$usrId}|recovery"] ?? null;
+        if ($mfaId === null) {
+            throw new Exceptions\InvalidCredentialException('No active recovery factor for user');
+        }
+        $normalized = Mfa\RecoveryCodes::normalizeInput($code);
+        if (!Mfa\RecoveryCodes::isValid($normalized)) {
+            throw new Exceptions\InvalidCredentialException('Recovery code is malformed');
+        }
+        $hashes = $this->mfaRecoveryHashes[$mfaId];
+        $consumed =& $this->mfaRecoveryConsumed[$mfaId];
+        // Walk every active slot regardless of an early match — keeps work
+        // constant relative to the active set so timing doesn't leak which
+        // slot matched.
+        $matchedSlot = -1;
+        foreach ($hashes as $i => $h) {
+            if ($consumed[$i]) continue;
+            if (PasswordHashing::verify($h, $normalized) && $matchedSlot === -1) {
+                $matchedSlot = $i;
+            }
+        }
+        if ($matchedSlot === -1) {
+            throw new Exceptions\InvalidCredentialException('Recovery code did not verify');
+        }
+        $consumed[$matchedSlot] = true;
+        $factor = $this->mfaFactors[$mfaId];
+        if ($factor instanceof Mfa\RecoveryFactor) {
+            $remaining = count(array_filter($consumed, fn($c) => !$c));
+            $this->mfaFactors[$mfaId] = new Mfa\RecoveryFactor(
+                id: $factor->id, usrId: $factor->usrId,
+                status: $factor->status, replaces: $factor->replaces,
+                createdAt: $factor->createdAt, updatedAt: $this->now(),
+                remaining: $remaining,
+            );
+        }
+        return new Mfa\MfaVerifyResult(
+            mfaId: $mfaId, type: Mfa\FactorType::Recovery,
+            mfaVerifiedAt: $this->now(), newSignCount: null,
+        );
+    }
+
+    public function getMfaPolicy(string $usrId): ?Mfa\UserMfaPolicy
+    {
+        $this->requireUser($usrId);
+        return $this->mfaPolicies[$usrId] ?? null;
+    }
+
+    public function setMfaPolicy(
+        string $usrId,
+        bool $required,
+        ?\DateTimeImmutable $graceUntil = null,
+    ): Mfa\UserMfaPolicy {
+        $this->requireUser($usrId);
+        $policy = new Mfa\UserMfaPolicy(
+            usrId: $usrId,
+            required: $required,
+            graceUntil: $graceUntil,
+            updatedAt: $this->now(),
+        );
+        $this->mfaPolicies[$usrId] = $policy;
+        return $policy;
+    }
+
+    // ─── private helpers ───
+
+    private function requireFactor(string $mfaId): Mfa\TotpFactor|Mfa\WebAuthnFactor|Mfa\RecoveryFactor
+    {
+        $f = $this->mfaFactors[$mfaId] ?? null;
+        if ($f === null) {
+            throw new Exceptions\NotFoundException("MFA factor {$mfaId} not found");
+        }
+        return $f;
+    }
+
+    private function checkUserActive(string $usrId): void
+    {
+        $user = $this->requireUser($usrId);
+        if ($user->status !== Status::Active) {
+            throw new Exceptions\PreconditionException(
+                "User {$usrId} is {$user->status->value}; cannot enroll MFA",
+                'user_not_active',
+            );
+        }
+    }
+
+    private function enforceNoActiveSingleton(string $usrId, string $type): void
+    {
+        if (isset($this->mfaActiveSingleton["{$usrId}|{$type}"])) {
+            throw new Exceptions\PreconditionException(
+                "User {$usrId} already has an active {$type} factor; revoke before re-enrolling",
+                'active_singleton_exists',
+            );
+        }
+    }
+
+    private function checkPendingNotExpired(
+        Mfa\TotpFactor|Mfa\WebAuthnFactor $factor,
+    ): void {
+        if ($factor->status !== Mfa\FactorStatus::Pending) return;
+        $ageSec = $this->now()->getTimestamp() - $factor->createdAt->getTimestamp();
+        if ($ageSec > self::PENDING_FACTOR_TTL_SECONDS) {
+            throw new Exceptions\PreconditionException(
+                "Pending factor {$factor->id} expired "
+                . "({$ageSec}s > " . self::PENDING_FACTOR_TTL_SECONDS . 's)',
+                'pending_factor_expired',
+            );
+        }
+    }
+
+    /** Inline RFC 4648 base32 — matches the Python SDK's otpauth URI. */
+    private static function base32Encode(string $buf): string
+    {
+        $alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+        $bits = 0; $value = 0; $out = '';
+        for ($i = 0, $n = strlen($buf); $i < $n; $i++) {
+            $value = ($value << 8) | ord($buf[$i]);
+            $bits += 8;
+            while ($bits >= 5) {
+                $out .= $alphabet[($value >> ($bits - 5)) & 0x1F];
+                $bits -= 5;
+            }
+        }
+        if ($bits > 0) {
+            $out .= $alphabet[($value << (5 - $bits)) & 0x1F];
+        }
+        return $out;
+    }
 }

@@ -80,4 +80,64 @@ interface IdentityStore
 
     public function refreshSession(string $sesId): SessionWithToken;
     public function revokeSession(string $sesId): Session;
+
+    // ─── v0.2 MFA store operations (ADR 0008) ───
+
+    /**
+     * @return array{factor: \Flametrench\Identity\Mfa\TotpFactor, secretB32: string, otpauthUri: string}
+     */
+    public function enrollTotpFactor(string $usrId, string $identifier): array;
+
+    /**
+     * @return array{factor: \Flametrench\Identity\Mfa\WebAuthnFactor}
+     *
+     * @param  list<string>|null  $transports
+     */
+    public function enrollWebAuthnFactor(
+        string $usrId,
+        string $identifier,
+        string $publicKey,
+        int $signCount,
+        string $rpId,
+        ?string $aaguid = null,
+        ?array $transports = null,
+    ): array;
+
+    /**
+     * @return array{factor: \Flametrench\Identity\Mfa\RecoveryFactor, codes: list<string>}
+     */
+    public function enrollRecoveryFactor(string $usrId): array;
+
+    public function confirmTotpFactor(string $mfaId, string $code): \Flametrench\Identity\Mfa\TotpFactor;
+
+    public function confirmWebAuthnFactor(
+        string $mfaId,
+        string $authenticatorData,
+        string $clientDataJson,
+        string $signature,
+        string $expectedChallenge,
+        string $expectedOrigin,
+    ): \Flametrench\Identity\Mfa\WebAuthnFactor;
+
+    /**
+     * @return list<\Flametrench\Identity\Mfa\TotpFactor|\Flametrench\Identity\Mfa\WebAuthnFactor|\Flametrench\Identity\Mfa\RecoveryFactor>
+     */
+    public function listMfaFactors(string $usrId): array;
+
+    public function getMfaFactor(string $mfaId): \Flametrench\Identity\Mfa\TotpFactor|\Flametrench\Identity\Mfa\WebAuthnFactor|\Flametrench\Identity\Mfa\RecoveryFactor;
+
+    public function revokeMfaFactor(string $mfaId): \Flametrench\Identity\Mfa\TotpFactor|\Flametrench\Identity\Mfa\WebAuthnFactor|\Flametrench\Identity\Mfa\RecoveryFactor;
+
+    public function verifyMfa(
+        string $usrId,
+        \Flametrench\Identity\Mfa\MfaProof $proof,
+    ): \Flametrench\Identity\Mfa\MfaVerifyResult;
+
+    public function getMfaPolicy(string $usrId): ?\Flametrench\Identity\Mfa\UserMfaPolicy;
+
+    public function setMfaPolicy(
+        string $usrId,
+        bool $required,
+        ?\DateTimeImmutable $graceUntil = null,
+    ): \Flametrench\Identity\Mfa\UserMfaPolicy;
 }
