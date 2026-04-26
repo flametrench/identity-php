@@ -19,8 +19,10 @@
 
 declare(strict_types=1);
 
+use Flametrench\Identity\Exceptions\WebAuthnException;
 use Flametrench\Identity\Mfa\RecoveryCodes;
 use Flametrench\Identity\Mfa\Totp;
+use Flametrench\Identity\Mfa\WebAuthn;
 use Flametrench\Identity\PasswordHashing;
 
 const IDENTITY_FIXTURES_DIR = __DIR__ . '/conformance/fixtures';
@@ -94,3 +96,56 @@ describe(
         }
     },
 );
+
+// ─── v0.2: identity.webauthn_verify_assertion ───
+
+/**
+ * Run one WebAuthn fixture test case (with shared inputs merged in)
+ * and return the harness comparison shape.
+ *
+ * @param  array<string,mixed>  $shared
+ * @param  array<string,mixed>  $test
+ * @return array<string,mixed>
+ */
+function runWebauthnFixture(array $shared, array $test): array
+{
+    $inp = array_merge($shared, $test['input']);
+    try {
+        $result = WebAuthn::verifyAssertion(
+            cosePublicKey: hex2bin($inp['cose_public_key_hex']),
+            storedSignCount: $inp['stored_sign_count'],
+            storedRpId: $inp['stored_rp_id'],
+            expectedChallenge: hex2bin($inp['expected_challenge_hex']),
+            expectedOrigin: $inp['expected_origin'],
+            authenticatorData: hex2bin($inp['authenticator_data_hex']),
+            clientDataJson: hex2bin($inp['client_data_json_hex']),
+            signature: hex2bin($inp['signature_hex']),
+            requireUserVerified: $inp['require_user_verified'] ?? true,
+            requireUserPresent: $inp['require_user_present'] ?? true,
+        );
+        return ['ok' => true, 'new_sign_count' => $result->newSignCount];
+    } catch (WebAuthnException $e) {
+        return ['ok' => false, 'reason' => $e->reason];
+    }
+}
+
+foreach (
+    [
+        'identity/mfa/webauthn-assertion.json',
+        'identity/mfa/webauthn-counter-decrease-rejected.json',
+    ] as $fixturePath
+) {
+    describe(
+        "Conformance · identity.webauthn_verify_assertion [MUST] · {$fixturePath}",
+        function () use ($fixturePath) {
+            $fixture = loadIdentityFixture($fixturePath);
+            $shared = $fixture['shared'] ?? [];
+            foreach ($fixture['tests'] as $t) {
+                it("[{$t['id']}] {$t['description']}", function () use ($shared, $t) {
+                    $actual = runWebauthnFixture($shared, $t);
+                    expect($actual)->toBe($t['expected']['result']);
+                });
+            }
+        },
+    );
+}
