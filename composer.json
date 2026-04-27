@@ -16,6 +16,10 @@
         "ext-sodium": "*",
         "flametrench/ids": "^0.2.0-rc"
     },
+    "suggest": {
+        "ext-pdo": "Required by PostgresIdentityStore for the durable backend.",
+        "ext-pdo_pgsql": "Postgres driver for PostgresIdentityStore."
+    },
     "require-dev": {
         "pestphp/pest": "^3.0"
     },

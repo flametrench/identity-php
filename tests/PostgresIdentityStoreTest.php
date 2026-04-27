@@ -1,0 +1,295 @@
+<?php
+
+// Copyright 2026 NDC Digital, LLC
+// SPDX-License-Identifier: Apache-2.0
+
+declare(strict_types=1);
+
+use Flametrench\Identity\CredentialType;
+use Flametrench\Identity\Exceptions\AlreadyTerminalException;
+use Flametrench\Identity\Exceptions\CredentialNotActiveException;
+use Flametrench\Identity\Exceptions\DuplicateCredentialException;
+use Flametrench\Identity\Exceptions\InvalidCredentialException;
+use Flametrench\Identity\Exceptions\InvalidTokenException;
+use Flametrench\Identity\Exceptions\NotFoundException;
+use Flametrench\Identity\Exceptions\PreconditionException;
+use Flametrench\Identity\Exceptions\SessionExpiredException;
+use Flametrench\Identity\Mfa\FactorStatus;
+use Flametrench\Identity\Mfa\FactorType;
+use Flametrench\Identity\Mfa\RecoveryCodes;
+use Flametrench\Identity\Mfa\RecoveryFactor;
+use Flametrench\Identity\Mfa\RecoveryProof;
+use Flametrench\Identity\Mfa\Totp;
+use Flametrench\Identity\Mfa\TotpProof;
+use Flametrench\Identity\PasskeyCredential;
+use Flametrench\Identity\PasswordCredential;
+use Flametrench\Identity\PostgresIdentityStore;
+use Flametrench\Identity\Status;
+use Flametrench\Ids\Id;
+
+$identityPostgresUrl = getenv('IDENTITY_POSTGRES_URL') ?: null;
+
+if ($identityPostgresUrl === null) {
+    fwrite(STDERR, "[PostgresIdentityStoreTest] IDENTITY_POSTGRES_URL not set; tests skipped.\n");
+    return;
+}
+
+beforeEach(function () use ($identityPostgresUrl) {
+    $pdo = identityPgPdoFromUrl($identityPostgresUrl);
+    $this->pdo = $pdo;
+    $pdo->exec('DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public;');
+    $pdo->exec((string) file_get_contents(__DIR__ . '/postgres-schema.sql'));
+    $this->store = new PostgresIdentityStore($pdo);
+});
+
+// ───── Users ─────
+
+it('createUser yields a fresh active usr_ id', function () {
+    $u = $this->store->createUser();
+    expect($u->id)->toMatch('/^usr_[0-9a-f]{32}$/');
+    expect($u->status)->toBe(Status::Active);
+});
+
+it('getUser raises NotFoundException for unknown ids', function () {
+    $this->store->getUser(Id::generate('usr'));
+})->throws(NotFoundException::class);
+
+it('suspend → reinstate round-trip', function () {
+    $u = $this->store->createUser();
+    $suspended = $this->store->suspendUser($u->id);
+    expect($suspended->status)->toBe(Status::Suspended);
+    $reinstated = $this->store->reinstateUser($u->id);
+    expect($reinstated->status)->toBe(Status::Active);
+});
+
+it('revokeUser cascades to credentials and sessions', function () {
+    $u = $this->store->createUser();
+    $cred = $this->store->createPasswordCredential($u->id, 'alice@example.com', 'pw');
+    $session = $this->store->createSession($u->id, $cred->id, 3600);
+    $this->store->revokeUser($u->id);
+    expect($this->store->getUser($u->id)->status)->toBe(Status::Revoked);
+    expect($this->store->getCredential($cred->id)->getStatus())->toBe(Status::Revoked);
+    expect($this->store->getSession($session->session->id)->revokedAt)->not->toBeNull();
+});
+
+it('double-revoke is rejected', function () {
+    $u = $this->store->createUser();
+    $this->store->revokeUser($u->id);
+    $this->store->revokeUser($u->id);
+})->throws(AlreadyTerminalException::class);
+
+// ───── Credentials ─────
+
+it('creates a password credential and verifyPassword round-trips', function () {
+    $u = $this->store->createUser();
+    $cred = $this->store->createPasswordCredential($u->id, 'alice@example.com', 'correct horse battery staple');
+    expect($cred)->toBeInstanceOf(PasswordCredential::class);
+    $verified = $this->store->verifyPassword('alice@example.com', 'correct horse battery staple');
+    expect($verified->usrId)->toBe($u->id);
+    expect($verified->credId)->toBe($cred->id);
+});
+
+it('verifyPassword rejects a wrong password', function () {
+    $u = $this->store->createUser();
+    $this->store->createPasswordCredential($u->id, 'alice@example.com', 'pw');
+    $this->store->verifyPassword('alice@example.com', 'wrong');
+})->throws(InvalidCredentialException::class);
+
+it('rejects a duplicate active credential on the same (type, identifier)', function () {
+    $u = $this->store->createUser();
+    $this->store->createPasswordCredential($u->id, 'alice@example.com', 'p1');
+    $this->store->createPasswordCredential($u->id, 'alice@example.com', 'p2');
+})->throws(DuplicateCredentialException::class);
+
+it('rotatePassword revokes old, inserts new with replaces, terminates sessions', function () {
+    $u = $this->store->createUser();
+    $oldCred = $this->store->createPasswordCredential($u->id, 'alice@example.com', 'old');
+    $session = $this->store->createSession($u->id, $oldCred->id, 3600);
+    $newCred = $this->store->rotatePassword($oldCred->id, 'new');
+    expect($newCred->replaces)->toBe($oldCred->id);
+    expect($this->store->getCredential($oldCred->id)->getStatus())->toBe(Status::Revoked);
+    expect($this->store->getSession($session->session->id)->revokedAt)->not->toBeNull();
+
+    expect(fn() => $this->store->verifyPassword('alice@example.com', 'old'))
+        ->toThrow(InvalidCredentialException::class);
+    $verified = $this->store->verifyPassword('alice@example.com', 'new');
+    expect($verified->credId)->toBe($newCred->id);
+});
+
+it('findCredentialByIdentifier returns active only', function () {
+    $u = $this->store->createUser();
+    $cred = $this->store->createPasswordCredential($u->id, 'alice@example.com', 'p');
+    $found = $this->store->findCredentialByIdentifier(CredentialType::Password, 'alice@example.com');
+    expect($found?->getId())->toBe($cred->id);
+    $this->store->revokeCredential($cred->id);
+    expect($this->store->findCredentialByIdentifier(CredentialType::Password, 'alice@example.com'))
+        ->toBeNull();
+});
+
+// ───── Sessions ─────
+
+it('createSession returns a token distinct from the session id and verifies', function () {
+    $u = $this->store->createUser();
+    $cred = $this->store->createPasswordCredential($u->id, 'alice@example.com', 'p');
+    $sw = $this->store->createSession($u->id, $cred->id, 3600);
+    expect($sw->token)->not->toBe($sw->session->id);
+    $verified = $this->store->verifySessionToken($sw->token);
+    expect($verified->id)->toBe($sw->session->id);
+});
+
+it('verifySessionToken rejects an unknown token', function () {
+    $this->store->verifySessionToken('nope');
+})->throws(InvalidTokenException::class);
+
+it('verifySessionToken rejects a revoked session token', function () {
+    $u = $this->store->createUser();
+    $cred = $this->store->createPasswordCredential($u->id, 'alice@example.com', 'p');
+    $sw = $this->store->createSession($u->id, $cred->id, 3600);
+    $this->store->revokeSession($sw->session->id);
+    $this->store->verifySessionToken($sw->token);
+})->throws(SessionExpiredException::class);
+
+it('refreshSession returns a new session with a fresh token', function () {
+    $u = $this->store->createUser();
+    $cred = $this->store->createPasswordCredential($u->id, 'alice@example.com', 'p');
+    $sw = $this->store->createSession($u->id, $cred->id, 3600);
+    $refreshed = $this->store->refreshSession($sw->session->id);
+    expect($refreshed->session->id)->not->toBe($sw->session->id);
+    expect($refreshed->token)->not->toBe($sw->token);
+    expect($this->store->getSession($sw->session->id)->revokedAt)->not->toBeNull();
+});
+
+it('createSession rejects TTL below 60 seconds', function () {
+    $u = $this->store->createUser();
+    $cred = $this->store->createPasswordCredential($u->id, 'alice@example.com', 'p');
+    $this->store->createSession($u->id, $cred->id, 30);
+})->throws(PreconditionException::class);
+
+it('createSession rejects a suspended credential', function () {
+    $u = $this->store->createUser();
+    $cred = $this->store->createPasswordCredential($u->id, 'alice@example.com', 'p');
+    $this->store->suspendCredential($cred->id);
+    $this->store->createSession($u->id, $cred->id, 3600);
+})->throws(CredentialNotActiveException::class);
+
+// ───── MFA ─────
+
+it('enrollTotpFactor → confirmTotpFactor → verifyMfa round-trips', function () {
+    $u = $this->store->createUser();
+    $enroll = $this->store->enrollTotpFactor($u->id, 'iPhone');
+    expect($enroll['factor']->status)->toBe(FactorStatus::Pending);
+    expect(strlen($enroll['secretB32']))->toBeGreaterThan(0);
+    expect(str_starts_with($enroll['otpauthUri'], 'otpauth://totp/'))->toBeTrue();
+
+    $secretBytes = base32Decode($enroll['secretB32']);
+    $code = Totp::compute($secretBytes, time());
+
+    $active = $this->store->confirmTotpFactor($enroll['factor']->id, $code);
+    expect($active->status)->toBe(FactorStatus::Active);
+
+    $result = $this->store->verifyMfa($u->id, new TotpProof($code));
+    expect($result->type)->toBe(FactorType::Totp);
+    expect($result->mfaId)->toBe($active->id);
+});
+
+it('enforces at-most-one active TOTP factor per user', function () {
+    $u = $this->store->createUser();
+    $first = $this->store->enrollTotpFactor($u->id, 'iPhone');
+    $code = Totp::compute(base32Decode($first['secretB32']), time());
+    $this->store->confirmTotpFactor($first['factor']->id, $code);
+    $this->store->enrollTotpFactor($u->id, 'Yubico');
+})->throws(PreconditionException::class);
+
+it('recovery codes verify once and then are consumed', function () {
+    $u = $this->store->createUser();
+    $enroll = $this->store->enrollRecoveryFactor($u->id);
+    expect($enroll['codes'])->toHaveCount(10);
+    $first = $enroll['codes'][0];
+    $result = $this->store->verifyMfa($u->id, new RecoveryProof($first));
+    expect($result->type)->toBe(FactorType::Recovery);
+    // Same code reused → fail.
+    expect(fn() => $this->store->verifyMfa($u->id, new RecoveryProof($first)))
+        ->toThrow(InvalidCredentialException::class);
+    // Remaining drops.
+    $factors = $this->store->listMfaFactors($u->id);
+    $recovery = array_values(array_filter($factors, fn($f) => $f->type === FactorType::Recovery))[0];
+    expect($recovery)->toBeInstanceOf(RecoveryFactor::class);
+    expect($recovery->remaining)->toBe(9);
+});
+
+it('recovery factor rejects malformed input', function () {
+    $u = $this->store->createUser();
+    $this->store->enrollRecoveryFactor($u->id);
+    $this->store->verifyMfa($u->id, new RecoveryProof('not-a-code'));
+})->throws(InvalidCredentialException::class);
+
+it('revokeMfaFactor frees up the singleton slot', function () {
+    $u = $this->store->createUser();
+    $first = $this->store->enrollTotpFactor($u->id, 'iPhone');
+    $code = Totp::compute(base32Decode($first['secretB32']), time());
+    $this->store->confirmTotpFactor($first['factor']->id, $code);
+    $this->store->revokeMfaFactor($first['factor']->id);
+    $second = $this->store->enrollTotpFactor($u->id, 'Yubico');
+    expect($second['factor']->status)->toBe(FactorStatus::Pending);
+});
+
+it('setMfaPolicy upserts and getMfaPolicy round-trips', function () {
+    $u = $this->store->createUser();
+    expect($this->store->getMfaPolicy($u->id))->toBeNull();
+    $grace = new \DateTimeImmutable('+14 days');
+    $set1 = $this->store->setMfaPolicy($u->id, required: true, graceUntil: $grace);
+    expect($set1->required)->toBeTrue();
+    expect($set1->graceUntil?->format('Y-m-d'))->toBe($grace->format('Y-m-d'));
+    $fetched = $this->store->getMfaPolicy($u->id);
+    expect($fetched?->required)->toBeTrue();
+    // Upsert: clear grace.
+    $set2 = $this->store->setMfaPolicy($u->id, required: true);
+    expect($set2->graceUntil)->toBeNull();
+});
+
+it('getMfaPolicy throws NotFoundException for unknown user', function () {
+    $this->store->getMfaPolicy(Id::generate('usr'));
+})->throws(NotFoundException::class);
+
+/**
+ * Convert a postgres:// URL into a PDO connection.
+ */
+function identityPgPdoFromUrl(string $url): PDO
+{
+    $parts = parse_url($url);
+    if ($parts === false) {
+        throw new RuntimeException("invalid postgres URL: {$url}");
+    }
+    $host = $parts['host'] ?? '127.0.0.1';
+    $port = $parts['port'] ?? 5432;
+    $db = ltrim($parts['path'] ?? '/postgres', '/');
+    $user = $parts['user'] ?? 'postgres';
+    $pass = $parts['pass'] ?? '';
+    $dsn = "pgsql:host={$host};port={$port};dbname={$db}";
+    return new PDO($dsn, $user, $pass, [
+        PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+    ]);
+}
+
+/** RFC 4648 base32 decode (uppercase, ignores padding). */
+function base32Decode(string $s): string
+{
+    $alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+    $stripped = strtoupper(rtrim($s, '='));
+    $bits = 0;
+    $value = 0;
+    $out = '';
+    for ($i = 0; $i < strlen($stripped); $i++) {
+        $idx = strpos($alphabet, $stripped[$i]);
+        if ($idx === false) {
+            throw new RuntimeException("invalid base32 char {$stripped[$i]}");
+        }
+        $value = ($value << 5) | $idx;
+        $bits += 5;
+        if ($bits >= 8) {
+            $out .= chr(($value >> ($bits - 8)) & 0xFF);
+            $bits -= 8;
+        }
+    }
+    return $out;
+}
