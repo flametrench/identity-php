@@ -1,10 +1,10 @@
 # flametrench/identity
 
-Identity primitives for [Flametrench](https://flametrench.dev): users, credentials (Argon2id-pinned password + passkey + OIDC), and user-bound sessions with rotation on refresh.
+Identity primitives for [Flametrench](https://flametrench.dev): users, credentials (Argon2id-pinned password + passkey + OIDC), user-bound sessions with rotation on refresh, and v0.2 multi-factor authentication ([ADR 0008](https://github.com/flametrench/spec/blob/main/decisions/0008-mfa.md), [ADR 0010](https://github.com/flametrench/spec/blob/main/decisions/0010-webauthn-rs256-eddsa.md)) — TOTP (RFC 6238), recovery codes, and WebAuthn assertion verification across ES256 / RS256 / EdDSA.
 
 The PHP counterpart of [`@flametrench/identity`](https://github.com/flametrench/node/tree/main/packages/identity). Same shapes, same lifecycle, same Argon2id parameter floor, same opaque-bearer-token-vs-session-id distinction.
 
-**Status:** v0.0.1 — early. PHP 8.3+, ext-sodium required (for token base64url encoding).
+**Status:** v0.2.0-rc.4 (release candidate). PHP 8.3+, ext-sodium required (for token base64url encoding). Includes the production-ready `PostgresIdentityStore` alongside the in-memory reference store.
 
 ## Install
 
