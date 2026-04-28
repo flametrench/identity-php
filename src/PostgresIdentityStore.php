@@ -887,9 +887,26 @@ final class PostgresIdentityStore implements IdentityStore
         if (!PasswordHashing::verify((string) $row['password_hash'], $password)) {
             throw new InvalidCredentialException('Invalid credential');
         }
+        // ADR 0008: surface usr_mfa_policy state. Apps MUST gate
+        // createSession on mfaRequired by calling verifyMfa first when true.
+        $polStmt = $this->pdo->prepare(
+            'SELECT required, grace_until FROM usr_mfa_policy WHERE usr_id = ?'
+        );
+        $polStmt->execute([(string) $row['usr_id']]);
+        $polRow = $polStmt->fetch(PDO::FETCH_ASSOC);
+        $mfaRequired = false;
+        if ($polRow !== false && (bool) $polRow['required']) {
+            $grace = $polRow['grace_until'];
+            if ($grace === null
+                || new \DateTimeImmutable((string) $grace) <= $this->now()
+            ) {
+                $mfaRequired = true;
+            }
+        }
         return new VerifiedCredential(
             usrId: Id::encode('usr', (string) $row['usr_id']),
             credId: Id::encode('cred', (string) $row['id']),
+            mfaRequired: $mfaRequired,
         );
     }
 

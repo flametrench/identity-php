@@ -494,7 +494,19 @@ final class InMemoryIdentityStore implements IdentityStore
             throw new InvalidCredentialException('Invalid credential');
         }
         $cred = $this->requireCredential($credId);
-        return new VerifiedCredential(usrId: $cred->getUsrId(), credId: $cred->getId());
+        // ADR 0008: surface usr_mfa_policy state.
+        $policy = $this->mfaPolicies[$cred->getUsrId()] ?? null;
+        $mfaRequired = false;
+        if ($policy !== null && $policy->required) {
+            if ($policy->graceUntil === null || $policy->graceUntil <= $this->now()) {
+                $mfaRequired = true;
+            }
+        }
+        return new VerifiedCredential(
+            usrId: $cred->getUsrId(),
+            credId: $cred->getId(),
+            mfaRequired: $mfaRequired,
+        );
     }
 
     // ─── Sessions ───

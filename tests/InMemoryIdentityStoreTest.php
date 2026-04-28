@@ -102,6 +102,40 @@ describe('password credentials', function () {
             ->toThrow(InvalidCredentialException::class);
     });
 
+    // ─── ADR 0008: usr_mfa_policy gate on verifyPassword ───
+
+    it('verifyPassword: mfaRequired=false when no policy set', function () {
+        $u = $this->store->createUser();
+        $this->store->createPasswordCredential($u->id, 'a@x', 'pw');
+        $r = $this->store->verifyPassword('a@x', 'pw');
+        expect($r->mfaRequired)->toBeFalse();
+    });
+
+    it('verifyPassword: mfaRequired=true when policy required and no grace', function () {
+        $u = $this->store->createUser();
+        $this->store->createPasswordCredential($u->id, 'a@x', 'pw');
+        $this->store->setMfaPolicy($u->id, required: true, graceUntil: null);
+        $r = $this->store->verifyPassword('a@x', 'pw');
+        expect($r->mfaRequired)->toBeTrue();
+    });
+
+    it('verifyPassword: mfaRequired=false during grace window', function () {
+        $u = $this->store->createUser();
+        $this->store->createPasswordCredential($u->id, 'a@x', 'pw');
+        $future = (new \DateTimeImmutable())->modify('+7 days');
+        $this->store->setMfaPolicy($u->id, required: true, graceUntil: $future);
+        $r = $this->store->verifyPassword('a@x', 'pw');
+        expect($r->mfaRequired)->toBeFalse();
+    });
+
+    it('verifyPassword: mfaRequired=false when policy required=false', function () {
+        $u = $this->store->createUser();
+        $this->store->createPasswordCredential($u->id, 'a@x', 'pw');
+        $this->store->setMfaPolicy($u->id, required: false, graceUntil: null);
+        $r = $this->store->verifyPassword('a@x', 'pw');
+        expect($r->mfaRequired)->toBeFalse();
+    });
+
     it('rotatePassword revokes old, issues new with replaces, and cascades sessions', function () {
         $u = $this->store->createUser();
         $oldCred = $this->store->createPasswordCredential($u->id, 'a@x', 'correcthorsebatterystaple');
