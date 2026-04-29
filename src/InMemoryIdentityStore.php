@@ -31,6 +31,8 @@ use Flametrench\Ids\Id;
  */
 final class InMemoryIdentityStore implements IdentityStore
 {
+    public const UNSET = IdentityStore::UNSET;
+
     /** @var array<string, User> */
     private array $users = [];
 
@@ -118,7 +120,7 @@ final class InMemoryIdentityStore implements IdentityStore
 
     // ─── Users ───
 
-    public function createUser(): User
+    public function createUser(?string $displayName = null): User
     {
         $now = $this->now();
         $u = new User(
@@ -126,6 +128,7 @@ final class InMemoryIdentityStore implements IdentityStore
             status: Status::Active,
             createdAt: $now,
             updatedAt: $now,
+            displayName: $displayName,
         );
         $this->users[$u->id] = $u;
         return $u;
@@ -134,6 +137,31 @@ final class InMemoryIdentityStore implements IdentityStore
     public function getUser(string $usrId): User
     {
         return $this->requireUser($usrId);
+    }
+
+    public function updateUser(
+        string $usrId,
+        string|null $displayName = self::UNSET,
+    ): User {
+        $u = $this->requireUser($usrId);
+        if ($u->status === Status::Revoked) {
+            throw new AlreadyTerminalException(
+                "User {$usrId} is revoked; cannot update",
+            );
+        }
+        $newDisplayName = $displayName === self::UNSET ? $u->displayName : $displayName;
+        if ($newDisplayName === $u->displayName) {
+            return $u;
+        }
+        $updated = new User(
+            id: $u->id,
+            status: $u->status,
+            createdAt: $u->createdAt,
+            updatedAt: $this->now(),
+            displayName: $newDisplayName,
+        );
+        $this->users[$usrId] = $updated;
+        return $updated;
     }
 
     public function suspendUser(string $usrId): User

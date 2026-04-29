@@ -55,6 +55,8 @@ use PDOException;
  */
 final class PostgresIdentityStore implements IdentityStore
 {
+    public const UNSET = IdentityStore::UNSET;
+
     /** Pending TOTP/WebAuthn factor TTL per ADR 0008. */
     public const PENDING_FACTOR_TTL_SECONDS = 600;
 
@@ -219,6 +221,9 @@ final class PostgresIdentityStore implements IdentityStore
             status: Status::from((string) $r['status']),
             createdAt: new \DateTimeImmutable((string) $r['created_at']),
             updatedAt: new \DateTimeImmutable((string) $r['updated_at']),
+            displayName: array_key_exists('display_name', $r) && $r['display_name'] !== null
+                ? (string) $r['display_name']
+                : null,
         );
     }
 
@@ -458,25 +463,59 @@ final class PostgresIdentityStore implements IdentityStore
 
     // ─── Users ───
 
-    public function createUser(): User
+    public function createUser(?string $displayName = null): User
     {
-        return $this->nested(function () {
+        return $this->nested(function () use ($displayName) {
             $id = Id::decode(Id::generate('usr'))['uuid'];
             $stmt = $this->pdo->prepare(
-                'INSERT INTO usr (id) VALUES (?)
-                 RETURNING id, status, created_at, updated_at'
+                'INSERT INTO usr (id, display_name) VALUES (?, ?)
+                 RETURNING id, status, display_name, created_at, updated_at'
             );
-            $stmt->execute([$id]);
+            $stmt->execute([$id, $displayName]);
             /** @var array<string, mixed> $row */
             $row = $stmt->fetch(PDO::FETCH_ASSOC);
             return self::rowToUser($row);
         });
     }
 
+    public function updateUser(
+        string $usrId,
+        string|null $displayName = self::UNSET,
+    ): User {
+        return $this->nested(function () use ($usrId, $displayName) {
+            $uuid = self::wireToUuid($usrId);
+            $stmt = $this->pdo->prepare(
+                'SELECT id, status, display_name, created_at, updated_at
+                 FROM usr WHERE id = ? FOR UPDATE'
+            );
+            $stmt->execute([$uuid]);
+            $row = $stmt->fetch(PDO::FETCH_ASSOC);
+            if ($row === false) {
+                throw new NotFoundException("User {$usrId} not found");
+            }
+            if ($row['status'] === 'revoked') {
+                throw new AlreadyTerminalException("User {$usrId} is revoked; cannot update");
+            }
+            $newDisplayName = $displayName === self::UNSET ? $row['display_name'] : $displayName;
+            if ($newDisplayName === $row['display_name']) {
+                return self::rowToUser($row);
+            }
+            $upd = $this->pdo->prepare(
+                'UPDATE usr SET display_name = ?, updated_at = now()
+                 WHERE id = ?
+                 RETURNING id, status, display_name, created_at, updated_at'
+            );
+            $upd->execute([$newDisplayName, $uuid]);
+            /** @var array<string, mixed> $updated */
+            $updated = $upd->fetch(PDO::FETCH_ASSOC);
+            return self::rowToUser($updated);
+        });
+    }
+
     public function getUser(string $usrId): User
     {
         $stmt = $this->pdo->prepare(
-            'SELECT id, status, created_at, updated_at FROM usr WHERE id = ?'
+            'SELECT id, status, display_name, created_at, updated_at FROM usr WHERE id = ?'
         );
         $stmt->execute([self::wireToUuid($usrId)]);
         $row = $stmt->fetch(PDO::FETCH_ASSOC);
@@ -491,7 +530,7 @@ final class PostgresIdentityStore implements IdentityStore
         return $this->tx(function () use ($usrId) {
             $uuid = self::wireToUuid($usrId);
             $cur = $this->pdo->prepare(
-                'SELECT id, status, created_at, updated_at FROM usr WHERE id = ? FOR UPDATE'
+                'SELECT id, status, display_name, created_at, updated_at FROM usr WHERE id = ? FOR UPDATE'
             );
             $cur->execute([$uuid]);
             $row = $cur->fetch(PDO::FETCH_ASSOC);
@@ -506,7 +545,7 @@ final class PostgresIdentityStore implements IdentityStore
             }
             $upd = $this->pdo->prepare(
                 "UPDATE usr SET status = 'suspended' WHERE id = ?
-                 RETURNING id, status, created_at, updated_at"
+                 RETURNING id, status, display_name, created_at, updated_at"
             );
             $upd->execute([$uuid]);
             /** @var array<string, mixed> $updated */
@@ -525,7 +564,7 @@ final class PostgresIdentityStore implements IdentityStore
         return $this->tx(function () use ($usrId) {
             $uuid = self::wireToUuid($usrId);
             $cur = $this->pdo->prepare(
-                'SELECT id, status, created_at, updated_at FROM usr WHERE id = ? FOR UPDATE'
+                'SELECT id, status, display_name, created_at, updated_at FROM usr WHERE id = ? FOR UPDATE'
             );
             $cur->execute([$uuid]);
             $row = $cur->fetch(PDO::FETCH_ASSOC);
@@ -540,7 +579,7 @@ final class PostgresIdentityStore implements IdentityStore
             }
             $upd = $this->pdo->prepare(
                 "UPDATE usr SET status = 'active' WHERE id = ?
-                 RETURNING id, status, created_at, updated_at"
+                 RETURNING id, status, display_name, created_at, updated_at"
             );
             $upd->execute([$uuid]);
             /** @var array<string, mixed> $updated */
@@ -554,7 +593,7 @@ final class PostgresIdentityStore implements IdentityStore
         return $this->tx(function () use ($usrId) {
             $uuid = self::wireToUuid($usrId);
             $cur = $this->pdo->prepare(
-                'SELECT id, status, created_at, updated_at FROM usr WHERE id = ? FOR UPDATE'
+                'SELECT id, status, display_name, created_at, updated_at FROM usr WHERE id = ? FOR UPDATE'
             );
             $cur->execute([$uuid]);
             $row = $cur->fetch(PDO::FETCH_ASSOC);
@@ -577,7 +616,7 @@ final class PostgresIdentityStore implements IdentityStore
             $stmt->execute([$now, $uuid]);
             $upd = $this->pdo->prepare(
                 "UPDATE usr SET status = 'revoked' WHERE id = ?
-                 RETURNING id, status, created_at, updated_at"
+                 RETURNING id, status, display_name, created_at, updated_at"
             );
             $upd->execute([$uuid]);
             /** @var array<string, mixed> $updated */

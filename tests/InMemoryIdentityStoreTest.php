@@ -17,6 +17,7 @@ use Flametrench\Identity\Exceptions\PreconditionException;
 use Flametrench\Identity\InMemoryIdentityStore;
 use Flametrench\Identity\PasswordCredential;
 use Flametrench\Identity\Status;
+use Flametrench\Ids\Id;
 
 beforeEach(function () {
     $this->store = new InMemoryIdentityStore();
@@ -60,6 +61,58 @@ describe('user lifecycle', function () {
         $u = $this->store->createUser();
         $this->store->revokeUser($u->id);
         expect(fn() => $this->store->revokeUser($u->id))->toThrow(AlreadyTerminalException::class);
+    });
+});
+
+describe('display_name (ADR 0014)', function () {
+    it('createUser stores display_name when supplied', function () {
+        $u = $this->store->createUser('Alice');
+        expect($u->displayName)->toBe('Alice');
+        expect($this->store->getUser($u->id)->displayName)->toBe('Alice');
+    });
+
+    it('createUser defaults display_name to null', function () {
+        $u = $this->store->createUser();
+        expect($u->displayName)->toBeNull();
+    });
+
+    it('updateUser sets and clears display_name', function () {
+        $u = $this->store->createUser('Original');
+        $renamed = $this->store->updateUser($u->id, displayName: 'Renamed');
+        expect($renamed->displayName)->toBe('Renamed');
+        $cleared = $this->store->updateUser($u->id, displayName: null);
+        expect($cleared->displayName)->toBeNull();
+    });
+
+    it('updateUser with omitted displayName is a no-op (UNSET sentinel)', function () {
+        $u = $this->store->createUser('Original');
+        $unchanged = $this->store->updateUser($u->id);
+        expect($unchanged->displayName)->toBe('Original');
+    });
+
+    it('updateUser allows renaming a suspended user', function () {
+        $u = $this->store->createUser('Before');
+        $this->store->suspendUser($u->id);
+        $renamed = $this->store->updateUser($u->id, displayName: 'After');
+        expect($renamed->displayName)->toBe('After');
+        expect($renamed->status)->toBe(Status::Suspended);
+    });
+
+    it('updateUser on a revoked user raises AlreadyTerminalException', function () {
+        $u = $this->store->createUser();
+        $this->store->revokeUser($u->id);
+        expect(fn() => $this->store->updateUser($u->id, displayName: 'Whatever'))
+            ->toThrow(AlreadyTerminalException::class);
+    });
+
+    it('updateUser on unknown user raises NotFoundException', function () {
+        expect(fn() => $this->store->updateUser(Id::generate('usr'), displayName: 'ghost'))
+            ->toThrow(NotFoundException::class);
+    });
+
+    it('display_name accepts full Unicode without normalization', function () {
+        $u = $this->store->createUser('山田 太郎');
+        expect($this->store->getUser($u->id)->displayName)->toBe('山田 太郎');
     });
 });
 

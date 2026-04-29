@@ -14,10 +14,12 @@ final readonly class User
         public Status $status,
         public \DateTimeImmutable $createdAt,
         public \DateTimeImmutable $updatedAt,
+        /** v0.2 (ADR 0014) — optional human-meaningful render string. */
+        public ?string $displayName = null,
     ) {}
 
     public function withStatus(Status $status, \DateTimeImmutable $updatedAt): self
     {
-        return new self($this->id, $status, $this->createdAt, $updatedAt);
+        return new self($this->id, $status, $this->createdAt, $updatedAt, $this->displayName);
     }
 }

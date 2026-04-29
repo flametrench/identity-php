@@ -20,9 +20,32 @@ namespace Flametrench\Identity;
  */
 interface IdentityStore
 {
+    /**
+     * Sentinel for {@see updateUser} partial-update semantics (ADR 0014).
+     * Implementations re-export this constant.
+     */
+    public const UNSET = '__flametrench_unset__';
+
     // ─── Users ───
-    public function createUser(): User;
+
+    /**
+     * @param ?string $displayName v0.2 (ADR 0014) optional render string.
+     */
+    public function createUser(?string $displayName = null): User;
     public function getUser(string $usrId): User;
+
+    /**
+     * Partial update of v0.2 user metadata per ADR 0014.
+     *
+     * Pass {@see IdentityStore::UNSET} to skip a field; pass `null` to
+     * clear it. Suspended users MAY be updated; revoked users raise
+     * AlreadyTerminalException. Unknown ids raise NotFoundException.
+     */
+    public function updateUser(
+        string $usrId,
+        string|null $displayName = self::UNSET,
+    ): User;
+
     public function suspendUser(string $usrId): User;
     public function reinstateUser(string $usrId): User;
     public function revokeUser(string $usrId): User;

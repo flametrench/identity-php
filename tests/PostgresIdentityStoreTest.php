@@ -251,6 +251,54 @@ it('getMfaPolicy throws NotFoundException for unknown user', function () {
     $this->store->getMfaPolicy(Id::generate('usr'));
 })->throws(NotFoundException::class);
 
+// ───── display_name (ADR 0014) ─────
+
+it('createUser stores display_name when supplied; getUser round-trips it', function () {
+    $u = $this->store->createUser('Alice');
+    expect($u->displayName)->toBe('Alice');
+    expect($this->store->getUser($u->id)->displayName)->toBe('Alice');
+});
+
+it('createUser defaults display_name to null', function () {
+    $u = $this->store->createUser();
+    expect($u->displayName)->toBeNull();
+});
+
+it('updateUser sets, leaves untouched, and clears display_name', function () {
+    $u = $this->store->createUser('Original');
+    $renamed = $this->store->updateUser($u->id, displayName: 'Renamed');
+    expect($renamed->displayName)->toBe('Renamed');
+    $unchanged = $this->store->updateUser($u->id);
+    expect($unchanged->displayName)->toBe('Renamed');
+    $cleared = $this->store->updateUser($u->id, displayName: null);
+    expect($cleared->displayName)->toBeNull();
+});
+
+it('updateUser allows renaming a suspended user', function () {
+    $u = $this->store->createUser('Before');
+    $this->store->suspendUser($u->id);
+    $renamed = $this->store->updateUser($u->id, displayName: 'After');
+    expect($renamed->displayName)->toBe('After');
+    expect($renamed->status)->toBe(Status::Suspended);
+});
+
+it('updateUser on a revoked user raises AlreadyTerminalException', function () {
+    $u = $this->store->createUser();
+    $this->store->revokeUser($u->id);
+    expect(fn() => $this->store->updateUser($u->id, displayName: 'Whatever'))
+        ->toThrow(AlreadyTerminalException::class);
+});
+
+it('updateUser on unknown user raises NotFoundException', function () {
+    expect(fn() => $this->store->updateUser(Id::generate('usr'), displayName: 'ghost'))
+        ->toThrow(NotFoundException::class);
+});
+
+it('display_name accepts full Unicode without normalization', function () {
+    $u = $this->store->createUser('山田 太郎');
+    expect($this->store->getUser($u->id)->displayName)->toBe('山田 太郎');
+});
+
 // ───── Outer-transaction nesting (ADR 0013) ─────
 
 it('createUser cooperates with an outer transaction (no nested-BEGIN error)', function () {
