@@ -64,6 +64,62 @@ describe('user lifecycle', function () {
     });
 });
 
+describe('listUsers (ADR 0015)', function () {
+    it('returns all users in id ASC order', function () {
+        $a = $this->store->createUser();
+        $b = $this->store->createUser();
+        $c = $this->store->createUser();
+        $page = $this->store->listUsers();
+        $ids = array_map(fn($u) => $u->id, $page->data);
+        expect($ids)->toEqual([$a->id, $b->id, $c->id]);
+        expect($page->nextCursor)->toBeNull();
+    });
+
+    it('status filter excludes other states', function () {
+        $active = $this->store->createUser();
+        $suspended = $this->store->createUser();
+        $this->store->suspendUser($suspended->id);
+        $ids = array_map(fn($u) => $u->id, $this->store->listUsers(status: \Flametrench\Identity\Status::Active)->data);
+        expect($ids)->toEqual([$active->id]);
+    });
+
+    it('query is case-insensitive substring against active credential identifiers', function () {
+        $alice = $this->store->createUser();
+        $this->store->createPasswordCredential($alice->id, 'alice@example.com', 'long-enough-password');
+        $bob = $this->store->createUser();
+        $this->store->createPasswordCredential($bob->id, 'bob@example.com', 'long-enough-password');
+        $carol = $this->store->createUser();
+        $this->store->createPasswordCredential($carol->id, 'carol@other.test', 'long-enough-password');
+        $page = $this->store->listUsers(query: 'EXAMPLE');
+        $ids = array_map(fn($u) => $u->id, $page->data);
+        expect($ids)->toEqualCanonicalizing([$alice->id, $bob->id]);
+    });
+
+    it('cursor walks pages', function () {
+        $ids = [];
+        for ($i = 0; $i < 5; $i++) {
+            $ids[] = $this->store->createUser()->id;
+        }
+        $page1 = $this->store->listUsers(limit: 2);
+        expect(array_map(fn($u) => $u->id, $page1->data))->toEqual([$ids[0], $ids[1]]);
+        $page2 = $this->store->listUsers(cursor: $page1->nextCursor, limit: 2);
+        expect(array_map(fn($u) => $u->id, $page2->data))->toEqual([$ids[2], $ids[3]]);
+        $page3 = $this->store->listUsers(cursor: $page2->nextCursor, limit: 2);
+        expect(array_map(fn($u) => $u->id, $page3->data))->toEqual([$ids[4]]);
+        expect($page3->nextCursor)->toBeNull();
+    });
+
+    it('returns display_name on each row', function () {
+        $alice = $this->store->createUser('Alice');
+        $bob = $this->store->createUser();
+        $page = $this->store->listUsers();
+        $byId = [];
+        foreach ($page->data as $u) { $byId[$u->id] = $u->displayName; }
+        expect($byId[$alice->id])->toBe('Alice');
+        expect($byId[$bob->id])->toBeNull();
+    });
+});
+
 describe('display_name (ADR 0014)', function () {
     it('createUser stores display_name when supplied', function () {
         $u = $this->store->createUser('Alice');

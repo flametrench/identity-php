@@ -178,6 +178,50 @@ final class InMemoryIdentityStore implements IdentityStore
         return $updated;
     }
 
+    public function listUsers(
+        ?string $cursor = null,
+        int $limit = 50,
+        ?string $query = null,
+        ?Status $status = null,
+    ): Page {
+        $limit = max(1, min($limit, 200));
+        $needle = $query !== null ? mb_strtolower($query) : null;
+        $matching = array_values(array_filter(
+            $this->users,
+            function (User $u) use ($needle, $status): bool {
+                if ($status !== null && $u->status !== $status) {
+                    return false;
+                }
+                if ($needle === null) {
+                    return true;
+                }
+                foreach ($this->credentials as $cred) {
+                    if ($cred->getUsrId() !== $u->id) continue;
+                    if ($cred->getStatus() !== Status::Active) continue;
+                    if (str_contains(mb_strtolower($cred->getIdentifier()), $needle)) {
+                        return true;
+                    }
+                }
+                return false;
+            },
+        ));
+        usort($matching, fn(User $a, User $b) => strcmp($a->id, $b->id));
+        if ($cursor !== null) {
+            $startIdx = 0;
+            foreach ($matching as $i => $item) {
+                if ($item->id > $cursor) { $startIdx = $i; break; }
+                $startIdx = $i + 1;
+            }
+        } else {
+            $startIdx = 0;
+        }
+        $slice = array_slice($matching, $startIdx, $limit);
+        $next = ($startIdx + $limit) < count($matching) && count($slice) > 0
+            ? $slice[count($slice) - 1]->id
+            : null;
+        return new Page(data: $slice, nextCursor: $next);
+    }
+
     public function reinstateUser(string $usrId): User
     {
         $u = $this->requireUser($usrId);

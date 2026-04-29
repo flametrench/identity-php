@@ -559,6 +559,45 @@ final class PostgresIdentityStore implements IdentityStore
         });
     }
 
+    public function listUsers(
+        ?string $cursor = null,
+        int $limit = 50,
+        ?string $query = null,
+        ?Status $status = null,
+    ): Page {
+        $limit = max(1, min($limit, 200));
+        $sql = 'SELECT id, status, display_name, created_at, updated_at FROM usr WHERE 1=1';
+        $params = [];
+        if ($cursor !== null) {
+            $sql .= ' AND id > ?';
+            $params[] = self::wireToUuid($cursor);
+        }
+        if ($status !== null) {
+            $sql .= ' AND status = ?';
+            $params[] = $status->value;
+        }
+        if ($query !== null) {
+            $sql .= ' AND EXISTS (
+                SELECT 1 FROM cred
+                WHERE cred.usr_id = usr.id
+                  AND cred.status = \'active\'
+                  AND cred.identifier ILIKE ?
+            )';
+            $params[] = '%' . str_replace(['\\', '%', '_'], ['\\\\', '\\%', '\\_'], $query) . '%';
+        }
+        $sql .= ' ORDER BY id LIMIT ?';
+        $params[] = $limit + 1;
+        $stmt = $this->pdo->prepare($sql);
+        $stmt->execute($params);
+        $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
+        $page = array_slice($rows, 0, $limit);
+        $users = array_map(self::rowToUser(...), $page);
+        $next = count($rows) > $limit && count($users) > 0
+            ? $users[count($users) - 1]->id
+            : null;
+        return new Page(data: $users, nextCursor: $next);
+    }
+
     public function reinstateUser(string $usrId): User
     {
         return $this->tx(function () use ($usrId) {

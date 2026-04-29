@@ -46,6 +46,24 @@ interface IdentityStore
         string|null $displayName = self::UNSET,
     ): User;
 
+    /**
+     * Paginated user enumeration introduced in v0.2 (ADR 0015).
+     *
+     * Adopters MUST gate the call site (sysadmin route or equivalent);
+     * the SDK does not enforce authorization. Cursor and ordering match
+     * `TenancyStore::listMembers`.
+     *
+     * @param ?string $query  Case-insensitive substring against active credential identifiers.
+     * @param ?Status $status Filter by user status; null = no filter.
+     * @return Page<User>
+     */
+    public function listUsers(
+        ?string $cursor = null,
+        int $limit = 50,
+        ?string $query = null,
+        ?Status $status = null,
+    ): Page;
+
     public function suspendUser(string $usrId): User;
     public function reinstateUser(string $usrId): User;
     public function revokeUser(string $usrId): User;

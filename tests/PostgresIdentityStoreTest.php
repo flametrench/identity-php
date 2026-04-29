@@ -251,6 +251,78 @@ it('getMfaPolicy throws NotFoundException for unknown user', function () {
     $this->store->getMfaPolicy(Id::generate('usr'));
 })->throws(NotFoundException::class);
 
+// ───── listUsers (ADR 0015) ─────
+
+it('listUsers returns all users in id ASC order', function () {
+    $a = $this->store->createUser();
+    $b = $this->store->createUser();
+    $c = $this->store->createUser();
+    $page = $this->store->listUsers();
+    $ids = array_map(fn($u) => $u->id, $page->data);
+    expect($ids)->toEqual([$a->id, $b->id, $c->id]);
+    expect($page->nextCursor)->toBeNull();
+});
+
+it('listUsers status filter excludes other states', function () {
+    $active = $this->store->createUser();
+    $suspended = $this->store->createUser();
+    $this->store->suspendUser($suspended->id);
+    $page = $this->store->listUsers(status: Status::Active);
+    $ids = array_map(fn($u) => $u->id, $page->data);
+    expect($ids)->toEqual([$active->id]);
+});
+
+it('listUsers query is case-insensitive substring against active credential identifiers', function () {
+    $alice = $this->store->createUser();
+    $this->store->createPasswordCredential($alice->id, 'alice@example.com', 'long-enough-password');
+    $bob = $this->store->createUser();
+    $this->store->createPasswordCredential($bob->id, 'bob@example.com', 'long-enough-password');
+    $carol = $this->store->createUser();
+    $this->store->createPasswordCredential($carol->id, 'carol@other.test', 'long-enough-password');
+
+    $page = $this->store->listUsers(query: 'EXAMPLE');
+    $ids = array_map(fn($u) => $u->id, $page->data);
+    expect($ids)->toEqualCanonicalizing([$alice->id, $bob->id]);
+});
+
+it('listUsers query skips revoked credentials', function () {
+    $alice = $this->store->createUser();
+    $cred = $this->store->createPasswordCredential($alice->id, 'gone@example.com', 'long-enough-password');
+    $this->store->revokeCredential($cred->id);
+    $page = $this->store->listUsers(query: 'gone@example.com');
+    expect($page->data)->toBeEmpty();
+});
+
+it('listUsers cursor walks pages', function () {
+    $ids = [];
+    for ($i = 0; $i < 5; $i++) {
+        $ids[] = $this->store->createUser()->id;
+    }
+    $page1 = $this->store->listUsers(limit: 2);
+    expect(array_map(fn($u) => $u->id, $page1->data))->toEqual([$ids[0], $ids[1]]);
+    $page2 = $this->store->listUsers(cursor: $page1->nextCursor, limit: 2);
+    expect(array_map(fn($u) => $u->id, $page2->data))->toEqual([$ids[2], $ids[3]]);
+    $page3 = $this->store->listUsers(cursor: $page2->nextCursor, limit: 2);
+    expect(array_map(fn($u) => $u->id, $page3->data))->toEqual([$ids[4]]);
+    expect($page3->nextCursor)->toBeNull();
+});
+
+it('listUsers on empty install returns empty page', function () {
+    $page = $this->store->listUsers();
+    expect($page->data)->toBeEmpty();
+    expect($page->nextCursor)->toBeNull();
+});
+
+it('listUsers returns display_name on each row', function () {
+    $alice = $this->store->createUser('Alice');
+    $bob = $this->store->createUser();
+    $page = $this->store->listUsers();
+    $byId = [];
+    foreach ($page->data as $u) { $byId[$u->id] = $u->displayName; }
+    expect($byId[$alice->id])->toBe('Alice');
+    expect($byId[$bob->id])->toBeNull();
+});
+
 // ───── display_name (ADR 0014) ─────
 
 it('createUser stores display_name when supplied; getUser round-trips it', function () {
