@@ -6,7 +6,7 @@ Identity primitives for [Flametrench](https://flametrench.dev): users, credentia
 
 The PHP counterpart of [`@flametrench/identity`](https://github.com/flametrench/node/tree/main/packages/identity). Same shapes, same lifecycle, same Argon2id parameter floor, same opaque-bearer-token-vs-session-id distinction.
 
-**Status:** v0.2.0-rc.4 (release candidate). PHP 8.3+, ext-sodium required (for token base64url encoding). Includes the production-ready `PostgresIdentityStore` alongside the in-memory reference store.
+**Status:** v0.2.0-rc.6 (release candidate). PHP 8.3+, ext-sodium required (for token base64url encoding). Includes the production-ready `PostgresIdentityStore` alongside the in-memory reference store. Per ADR 0014 the `User` entity carries an optional `display_name` with a partial-update `updateUser` operation; per ADR 0015 `listUsers` provides cursor-paginated user enumeration with a credential-identifier substring filter; per ADR 0013 the Postgres adapter cooperates with adopter-side outer transactions via savepoints when nested.
 
 ## Install
 
