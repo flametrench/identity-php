@@ -251,6 +251,61 @@ it('getMfaPolicy throws NotFoundException for unknown user', function () {
     $this->store->getMfaPolicy(Id::generate('usr'));
 })->throws(NotFoundException::class);
 
+// ───── Outer-transaction nesting (ADR 0013) ─────
+
+it('createUser cooperates with an outer transaction (no nested-BEGIN error)', function () {
+    $this->pdo->beginTransaction();
+    $u = $this->store->createUser();
+    expect($this->pdo->inTransaction())->toBeTrue();
+    $this->pdo->commit();
+
+    $fetched = $this->store->getUser($u->id);
+    expect($fetched->id)->toBe($u->id);
+});
+
+it('rolling back an outer transaction undoes the inner createUser + createPasswordCredential', function () {
+    $this->pdo->beginTransaction();
+    $u = $this->store->createUser();
+    $this->store->createPasswordCredential($u->id, 'rolled-back@example.test', 'hunter22-long-enough');
+    $this->pdo->rollBack();
+
+    expect(fn() => $this->store->getUser($u->id))->toThrow(NotFoundException::class);
+    $countStmt = $this->pdo->query("SELECT count(*) FROM cred WHERE identifier = 'rolled-back@example.test'");
+    expect((int) $countStmt->fetchColumn())->toBe(0);
+});
+
+it('outer transaction can commit a second SDK call after the first one rolls back its savepoint', function () {
+    // Seed an active credential so the next createPasswordCredential with the same identifier collides.
+    $seed = $this->store->createUser();
+    $this->store->createPasswordCredential($seed->id, 'taken@example.test', 'hunter22-long-enough');
+
+    $this->pdo->beginTransaction();
+    $u = $this->store->createUser();
+    try {
+        $this->store->createPasswordCredential($u->id, 'taken@example.test', 'hunter22-long-enough');
+        $this->fail('expected DuplicateCredentialException');
+    } catch (DuplicateCredentialException) {
+        // expected — savepoint rolled back, outer transaction still live
+    }
+
+    // Outer transaction is still usable; another SDK call commits cleanly.
+    $cred = $this->store->createPasswordCredential($u->id, 'survivor@example.test', 'hunter22-long-enough');
+    $this->pdo->commit();
+
+    expect($this->store->getUser($u->id)->id)->toBe($u->id);
+    expect($cred->identifier)->toBe('survivor@example.test');
+});
+
+it('multiple SDK calls in one outer transaction commit-or-rollback together', function () {
+    $this->pdo->beginTransaction();
+    $a = $this->store->createUser();
+    $b = $this->store->createUser();
+    $this->pdo->rollBack();
+
+    expect(fn() => $this->store->getUser($a->id))->toThrow(NotFoundException::class);
+    expect(fn() => $this->store->getUser($b->id))->toThrow(NotFoundException::class);
+});
+
 /**
  * Convert a postgres:// URL into a PDO connection.
  */

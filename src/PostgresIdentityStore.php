@@ -45,6 +45,13 @@ use PDOException;
  * Multi-statement ops (revokeUser cascade, rotation, refreshSession,
  * MFA confirm/verify) run inside a transaction so state transitions are
  * atomic.
+ *
+ * Multi-SDK transaction nesting (ADR 0013): when the supplied PDO is
+ * already inside a transaction at call time, this store cooperates by
+ * using SAVEPOINT/RELEASE instead of opening its own BEGIN. Adopters
+ * wrapping several SDK calls in one outer `DB::transaction(...)` MUST
+ * construct every participating store with the same `\PDO` instance —
+ * savepoints are connection-scoped and cannot bridge connections.
  */
 final class PostgresIdentityStore implements IdentityStore
 {
@@ -93,12 +100,28 @@ final class PostgresIdentityStore implements IdentityStore
     }
 
     /**
+     * Run $fn atomically. When called outside an active transaction the helper
+     * opens BEGIN/COMMIT around the work. When the connection is already inside
+     * a transaction (e.g. an adopter wrapped multiple SDK calls in
+     * `DB::transaction(...)`) the helper uses SAVEPOINT/RELEASE instead, so
+     * the adapter cooperates with the outer scope rather than fighting PDO's
+     * lack of nested-transaction support. See spec ADR 0013.
+     *
+     * Savepoint name follows `ft_<method>_<random>`: the method name preserves
+     * grep-ability in pg_stat_activity and pg logs; the random suffix makes
+     * pairing bugs surface as loud `savepoint does not exist` errors instead
+     * of silent half-commits.
+     *
      * @template T
      * @param callable(): T $fn
      * @return T
      */
     private function tx(callable $fn): mixed
     {
+        if ($this->pdo->inTransaction()) {
+            return $this->withSavepoint($fn, self::callerName());
+        }
+
         $this->pdo->beginTransaction();
         try {
             $result = $fn();
@@ -112,6 +135,72 @@ final class PostgresIdentityStore implements IdentityStore
             }
             throw $e;
         }
+    }
+
+    /**
+     * Run $fn with savepoint shielding when inside an outer transaction, or
+     * unwrapped when standalone (zero overhead). Used by single-statement
+     * methods (e.g. createPasswordCredential) that don't need their own
+     * BEGIN/COMMIT but must not contaminate an outer transaction on a
+     * constraint violation. Postgres aborts the entire transaction on any
+     * statement-level error (SQLSTATE 25P02 for subsequent statements) until
+     * the next ROLLBACK or ROLLBACK TO SAVEPOINT.
+     *
+     * @template T
+     * @param callable(): T $fn
+     * @return T
+     */
+    private function nested(callable $fn): mixed
+    {
+        if (!$this->pdo->inTransaction()) {
+            return $fn();
+        }
+        return $this->withSavepoint($fn, self::callerName());
+    }
+
+    /**
+     * Internal: wrap $fn in SAVEPOINT/RELEASE, rolling back to the savepoint
+     * and rethrowing on any exception. Caller is responsible for the
+     * inTransaction() check.
+     *
+     * @template T
+     * @param callable(): T $fn
+     * @return T
+     */
+    private function withSavepoint(callable $fn, string $caller): mixed
+    {
+        $savepoint = self::savepointName($caller);
+        $this->pdo->exec('SAVEPOINT ' . $savepoint);
+        try {
+            $result = $fn();
+            $this->pdo->exec('RELEASE SAVEPOINT ' . $savepoint);
+            return $result;
+        } catch (\Throwable $e) {
+            try {
+                $this->pdo->exec('ROLLBACK TO SAVEPOINT ' . $savepoint);
+                $this->pdo->exec('RELEASE SAVEPOINT ' . $savepoint);
+            } catch (\Throwable) {
+                // Surface the original error.
+            }
+            throw $e;
+        }
+    }
+
+    /** Read the immediate caller of the function that called this helper. */
+    private static function callerName(): string
+    {
+        $bt = \debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS, 3);
+        return (string) ($bt[2]['function'] ?? 'tx');
+    }
+
+    /** Build a savepoint name matching ADR 0013: `ft_<method>_<random>`. */
+    private static function savepointName(string $method): string
+    {
+        $method = preg_replace('/[^A-Za-z0-9]/', '', $method) ?? '';
+        if ($method === '') {
+            $method = 'tx';
+        }
+        return 'ft_' . $method . '_' . bin2hex(random_bytes(4));
     }
 
     private static function isUniqueViolation(PDOException $e): bool
@@ -371,15 +460,17 @@ final class PostgresIdentityStore implements IdentityStore
 
     public function createUser(): User
     {
-        $id = Id::decode(Id::generate('usr'))['uuid'];
-        $stmt = $this->pdo->prepare(
-            'INSERT INTO usr (id) VALUES (?)
-             RETURNING id, status, created_at, updated_at'
-        );
-        $stmt->execute([$id]);
-        /** @var array<string, mixed> $row */
-        $row = $stmt->fetch(PDO::FETCH_ASSOC);
-        return self::rowToUser($row);
+        return $this->nested(function () {
+            $id = Id::decode(Id::generate('usr'))['uuid'];
+            $stmt = $this->pdo->prepare(
+                'INSERT INTO usr (id) VALUES (?)
+                 RETURNING id, status, created_at, updated_at'
+            );
+            $stmt->execute([$id]);
+            /** @var array<string, mixed> $row */
+            $row = $stmt->fetch(PDO::FETCH_ASSOC);
+            return self::rowToUser($row);
+        });
     }
 
     public function getUser(string $usrId): User
@@ -520,29 +611,31 @@ final class PostgresIdentityStore implements IdentityStore
         string $identifier,
         string $password,
     ): PasswordCredential {
-        $userUuid = $this->ensureUserActive($usrId);
-        $id = Id::decode(Id::generate('cred'))['uuid'];
-        $hash = PasswordHashing::hash($password);
-        try {
-            $stmt = $this->pdo->prepare(
-                "INSERT INTO cred (id, usr_id, type, identifier, password_hash)
-                 VALUES (?, ?, 'password', ?, ?)
-                 RETURNING " . self::CRED_COLS
-            );
-            $stmt->execute([$id, $userUuid, $identifier, $hash]);
-            /** @var array<string, mixed> $row */
-            $row = $stmt->fetch(PDO::FETCH_ASSOC);
-            $cred = self::rowToCred($row);
-            assert($cred instanceof PasswordCredential);
-            return $cred;
-        } catch (PDOException $e) {
-            if (self::isUniqueViolation($e)) {
-                throw new DuplicateCredentialException(
-                    "An active password credential already exists for identifier {$identifier}",
+        return $this->nested(function () use ($usrId, $identifier, $password) {
+            $userUuid = $this->ensureUserActive($usrId);
+            $id = Id::decode(Id::generate('cred'))['uuid'];
+            $hash = PasswordHashing::hash($password);
+            try {
+                $stmt = $this->pdo->prepare(
+                    "INSERT INTO cred (id, usr_id, type, identifier, password_hash)
+                     VALUES (?, ?, 'password', ?, ?)
+                     RETURNING " . self::CRED_COLS
                 );
+                $stmt->execute([$id, $userUuid, $identifier, $hash]);
+                /** @var array<string, mixed> $row */
+                $row = $stmt->fetch(PDO::FETCH_ASSOC);
+                $cred = self::rowToCred($row);
+                assert($cred instanceof PasswordCredential);
+                return $cred;
+            } catch (PDOException $e) {
+                if (self::isUniqueViolation($e)) {
+                    throw new DuplicateCredentialException(
+                        "An active password credential already exists for identifier {$identifier}",
+                    );
+                }
+                throw $e;
             }
-            throw $e;
-        }
+        });
     }
 
     public function createPasskeyCredential(
@@ -552,35 +645,37 @@ final class PostgresIdentityStore implements IdentityStore
         int $signCount,
         string $rpId,
     ): PasskeyCredential {
-        $userUuid = $this->ensureUserActive($usrId);
-        $id = Id::decode(Id::generate('cred'))['uuid'];
-        try {
-            $stmt = $this->pdo->prepare(
-                "INSERT INTO cred (id, usr_id, type, identifier,
-                                   passkey_public_key, passkey_sign_count, passkey_rp_id)
-                 VALUES (?, ?, 'passkey', ?, ?, ?, ?)
-                 RETURNING " . self::CRED_COLS
-            );
-            $stmt->bindValue(1, $id);
-            $stmt->bindValue(2, $userUuid);
-            $stmt->bindValue(3, $identifier);
-            $stmt->bindValue(4, $publicKey, PDO::PARAM_LOB);
-            $stmt->bindValue(5, $signCount);
-            $stmt->bindValue(6, $rpId);
-            $stmt->execute();
-            /** @var array<string, mixed> $row */
-            $row = $stmt->fetch(PDO::FETCH_ASSOC);
-            $cred = self::rowToCred($row);
-            assert($cred instanceof PasskeyCredential);
-            return $cred;
-        } catch (PDOException $e) {
-            if (self::isUniqueViolation($e)) {
-                throw new DuplicateCredentialException(
-                    "An active passkey credential already exists for identifier {$identifier}",
+        return $this->nested(function () use ($usrId, $identifier, $publicKey, $signCount, $rpId) {
+            $userUuid = $this->ensureUserActive($usrId);
+            $id = Id::decode(Id::generate('cred'))['uuid'];
+            try {
+                $stmt = $this->pdo->prepare(
+                    "INSERT INTO cred (id, usr_id, type, identifier,
+                                       passkey_public_key, passkey_sign_count, passkey_rp_id)
+                     VALUES (?, ?, 'passkey', ?, ?, ?, ?)
+                     RETURNING " . self::CRED_COLS
                 );
+                $stmt->bindValue(1, $id);
+                $stmt->bindValue(2, $userUuid);
+                $stmt->bindValue(3, $identifier);
+                $stmt->bindValue(4, $publicKey, PDO::PARAM_LOB);
+                $stmt->bindValue(5, $signCount);
+                $stmt->bindValue(6, $rpId);
+                $stmt->execute();
+                /** @var array<string, mixed> $row */
+                $row = $stmt->fetch(PDO::FETCH_ASSOC);
+                $cred = self::rowToCred($row);
+                assert($cred instanceof PasskeyCredential);
+                return $cred;
+            } catch (PDOException $e) {
+                if (self::isUniqueViolation($e)) {
+                    throw new DuplicateCredentialException(
+                        "An active passkey credential already exists for identifier {$identifier}",
+                    );
+                }
+                throw $e;
             }
-            throw $e;
-        }
+        });
     }
 
     public function createOidcCredential(
@@ -589,28 +684,30 @@ final class PostgresIdentityStore implements IdentityStore
         string $oidcIssuer,
         string $oidcSubject,
     ): OidcCredential {
-        $userUuid = $this->ensureUserActive($usrId);
-        $id = Id::decode(Id::generate('cred'))['uuid'];
-        try {
-            $stmt = $this->pdo->prepare(
-                "INSERT INTO cred (id, usr_id, type, identifier, oidc_issuer, oidc_subject)
-                 VALUES (?, ?, 'oidc', ?, ?, ?)
-                 RETURNING " . self::CRED_COLS
-            );
-            $stmt->execute([$id, $userUuid, $identifier, $oidcIssuer, $oidcSubject]);
-            /** @var array<string, mixed> $row */
-            $row = $stmt->fetch(PDO::FETCH_ASSOC);
-            $cred = self::rowToCred($row);
-            assert($cred instanceof OidcCredential);
-            return $cred;
-        } catch (PDOException $e) {
-            if (self::isUniqueViolation($e)) {
-                throw new DuplicateCredentialException(
-                    "An active oidc credential already exists for identifier {$identifier}",
+        return $this->nested(function () use ($usrId, $identifier, $oidcIssuer, $oidcSubject) {
+            $userUuid = $this->ensureUserActive($usrId);
+            $id = Id::decode(Id::generate('cred'))['uuid'];
+            try {
+                $stmt = $this->pdo->prepare(
+                    "INSERT INTO cred (id, usr_id, type, identifier, oidc_issuer, oidc_subject)
+                     VALUES (?, ?, 'oidc', ?, ?, ?)
+                     RETURNING " . self::CRED_COLS
                 );
+                $stmt->execute([$id, $userUuid, $identifier, $oidcIssuer, $oidcSubject]);
+                /** @var array<string, mixed> $row */
+                $row = $stmt->fetch(PDO::FETCH_ASSOC);
+                $cred = self::rowToCred($row);
+                assert($cred instanceof OidcCredential);
+                return $cred;
+            } catch (PDOException $e) {
+                if (self::isUniqueViolation($e)) {
+                    throw new DuplicateCredentialException(
+                        "An active oidc credential already exists for identifier {$identifier}",
+                    );
+                }
+                throw $e;
             }
-            throw $e;
-        }
+        });
     }
 
     public function getCredential(string $credId): Credential
