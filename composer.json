@@ -14,7 +14,7 @@
     "require": {
         "php": "^8.3",
         "ext-sodium": "*",
-        "flametrench/ids": "^0.2.0-rc"
+        "flametrench/ids": "^0.2.0"
     },
     "suggest": {
         "ext-pdo": "Required by PostgresIdentityStore for the durable backend.",
