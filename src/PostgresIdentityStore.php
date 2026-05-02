@@ -2052,7 +2052,12 @@ final class PostgresIdentityStore implements IdentityStore
             || $this->patLastUsedCoalesceSeconds === 0
             || ($now->getTimestamp() - $persistedAt->getTimestamp()) >= $this->patLastUsedCoalesceSeconds;
         if ($shouldUpdate) {
-            $upd = $this->pdo->prepare('UPDATE pat SET last_used_at = ? WHERE id = ?');
+            // security-audit-v0.3.md H3: re-check revoked_at IS NULL in
+            // the UPDATE so a race with revokePat does not write
+            // last_used_at onto an already-revoked row.
+            $upd = $this->pdo->prepare(
+                'UPDATE pat SET last_used_at = ? WHERE id = ? AND revoked_at IS NULL'
+            );
             $upd->execute([self::fmt($now), self::wireToUuid($patId)]);
         }
 
