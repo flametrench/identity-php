@@ -1325,7 +1325,11 @@ final class InMemoryIdentityStore implements IdentityStore
             throw new InvalidPatTokenException();
         }
         $idHex = substr($token, 4, 32);
-        if (!ctype_xdigit($idHex)) {
+        // security-audit-v0.3.md M4: must reject uppercase hex per the
+        // wire format spec. ctype_xdigit() is case-insensitive — switch
+        // to a lowercase-only regex so the cross-SDK conformance fixture
+        // pat.token-format.rejects-uppercase-hex actually fails uppercase.
+        if (preg_match('/^[0-9a-f]{32}$/', $idHex) !== 1) {
             throw new InvalidPatTokenException();
         }
         if ($token[36] !== '_') {

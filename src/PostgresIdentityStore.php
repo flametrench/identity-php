@@ -1992,7 +1992,9 @@ final class PostgresIdentityStore implements IdentityStore
             throw new InvalidPatTokenException();
         }
         $idHex = substr($token, 4, 32);
-        if (!ctype_xdigit($idHex)) {
+        // security-audit-v0.3.md M4: lowercase hex only; ctype_xdigit
+        // accepts uppercase too (case-insensitive).
+        if (preg_match('/^[0-9a-f]{32}$/', $idHex) !== 1) {
             throw new InvalidPatTokenException();
         }
         if ($token[36] !== '_') {
