@@ -2010,6 +2010,9 @@ final class PostgresIdentityStore implements IdentityStore
         try {
             $uuid = self::wireToUuid($patId);
         } catch (\Throwable) {
+            // security-audit-v0.3.md H2: same timing-oracle defense
+            // for structurally-valid-but-not-UUIDv7 ids.
+            PasswordHashing::verify(\Flametrench\Identity\Pat\PatLimits::DUMMY_PHC_HASH, $secretSegment);
             throw new InvalidPatTokenException();
         }
         $stmt = $this->pdo->prepare(
@@ -2019,7 +2022,10 @@ final class PostgresIdentityStore implements IdentityStore
         $row = $stmt->fetch(PDO::FETCH_ASSOC);
 
         // Step 4: missing row → conflated InvalidPatTokenException.
+        // security-audit-v0.3.md H2: perform Argon2id verify against
+        // dummy hash so wall-clock time matches the row-exists path.
         if ($row === false) {
+            PasswordHashing::verify(\Flametrench\Identity\Pat\PatLimits::DUMMY_PHC_HASH, $secretSegment);
             throw new InvalidPatTokenException();
         }
         // Step 5: revoked terminal check.

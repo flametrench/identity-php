@@ -1337,8 +1337,14 @@ final class InMemoryIdentityStore implements IdentityStore
         $patId = "pat_{$idHex}";
 
         // Step 3–4: lookup; conflate "no row" with "wrong secret".
+        // security-audit-v0.3.md H2: when the row is missing we still
+        // perform an Argon2id verify against a dummy hash so the
+        // wall-clock time of "no such pat_id" matches the
+        // row-exists-but-wrong-secret path. Defends against pat_id
+        // existence probing via timing.
         $pat = $this->pats[$patId] ?? null;
         if ($pat === null) {
+            PasswordHashing::verify(\Flametrench\Identity\Pat\PatLimits::DUMMY_PHC_HASH, $secretSegment);
             throw new InvalidPatTokenException();
         }
 
