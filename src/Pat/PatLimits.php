@@ -47,5 +47,37 @@ final class PatLimits
      */
     public const MAX_SECRET_LENGTH = 256;
 
+    /**
+     * security-audit-v0.3.md M5 — pure structural validator for PAT
+     * bearer tokens per ADR 0016 §"Wire format". Returns true if
+     * ``$token`` matches ``pat_<32 lowercase hex>_<base64url>``. Does
+     * NOT hit the database or Argon2id verifier — adopters that
+     * pre-screen bearers before dispatch can use this to short-circuit
+     * obviously-bogus PATs. Mirrors the conformance fixture
+     * ``spec/conformance/fixtures/identity/pat/token-format.json``.
+     */
+    public static function isStructurallyValidToken(string $token): bool
+    {
+        return preg_match('/^pat_[0-9a-f]{32}_[A-Za-z0-9_\-]+$/', $token) === 1;
+    }
+
+    /**
+     * security-audit-v0.3.md M5 — pure prefix classifier per ADR 0016
+     * §"Bearer routing". Returns the ``auth.kind`` discriminator
+     * (``pat`` / ``share`` / ``session``) without invoking any verifier
+     * or DB lookup. Mirrors the conformance fixture
+     * ``spec/conformance/fixtures/identity/pat/bearer-prefix-routing.json``.
+     */
+    public static function classifyBearer(string $token): string
+    {
+        if (str_starts_with($token, 'pat_')) {
+            return 'pat';
+        }
+        if (str_starts_with($token, 'shr_')) {
+            return 'share';
+        }
+        return 'session';
+    }
+
     private function __construct() {}
 }

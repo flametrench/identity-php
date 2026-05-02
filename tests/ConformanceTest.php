@@ -23,6 +23,7 @@ use Flametrench\Identity\Exceptions\WebAuthnException;
 use Flametrench\Identity\Mfa\RecoveryCodes;
 use Flametrench\Identity\Mfa\Totp;
 use Flametrench\Identity\Mfa\WebAuthn;
+use Flametrench\Identity\Pat\PatLimits;
 use Flametrench\Identity\PasswordHashing;
 
 const IDENTITY_FIXTURES_DIR = __DIR__ . '/conformance/fixtures';
@@ -150,3 +151,34 @@ foreach (
         },
     );
 }
+
+// ─── v0.3: identity.verify_pat_token (structural validation) ───
+// security-audit-v0.3.md M5: every SDK consumes the same fixtures.
+
+describe(
+    'Conformance · identity.verify_pat_token [MUST] · structural',
+    function () {
+        $fixture = loadIdentityFixture('identity/pat/token-format.json');
+        foreach ($fixture['tests'] as $t) {
+            it("[{$t['id']}] {$t['description']}", function () use ($t) {
+                expect(PatLimits::isStructurallyValidToken($t['input']['token']))
+                    ->toBe($t['expected']['result']);
+            });
+        }
+    },
+);
+
+// ─── v0.3: identity.resolve_bearer (auth.kind classifier) ───
+
+describe(
+    'Conformance · identity.resolve_bearer [MUST] · auth.kind',
+    function () {
+        $fixture = loadIdentityFixture('identity/pat/bearer-prefix-routing.json');
+        foreach ($fixture['tests'] as $t) {
+            it("[{$t['id']}] {$t['description']}", function () use ($t) {
+                expect(PatLimits::classifyBearer($t['input']['token']))
+                    ->toBe($t['expected']['result']);
+            });
+        }
+    },
+);
