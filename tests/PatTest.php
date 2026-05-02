@@ -63,6 +63,26 @@ describe('createPat', function () {
         $store->createPat($u->id, name: 'laptop', scope: [], expiresAt: new \DateTimeImmutable('2026-04-01T00:00:00Z'));
     })->throws(PreconditionException::class);
 
+    // security-audit-v0.3.md H1: ADR 0016 §"Constraints" caps expires_at at
+    // 365 days from creation. Pre-fix this was unenforced — adopters could
+    // mint century-long PATs.
+    it('accepts an expires_at exactly 365 days out (cap inclusive)', function () {
+        $clock = new \DateTimeImmutable('2026-05-01T12:00:00Z');
+        $store = makeStore($clock);
+        $u = $store->createUser();
+        $exp = $clock->modify('+365 days');
+        $r = $store->createPat($u->id, name: 'laptop', scope: [], expiresAt: $exp);
+        expect($r['pat']->expiresAt->format('c'))->toBe($exp->format('c'));
+    });
+
+    it('rejects an expires_at beyond the 365-day cap', function () {
+        $clock = new \DateTimeImmutable('2026-05-01T12:00:00Z');
+        $store = makeStore($clock);
+        $u = $store->createUser();
+        $exp = $clock->modify('+365 days +1 second');
+        $store->createPat($u->id, name: 'laptop', scope: [], expiresAt: $exp);
+    })->throws(PreconditionException::class);
+
     it('refuses to issue PATs for revoked users', function () {
         $clock = new \DateTimeImmutable('2026-05-01T12:00:00Z');
         $store = makeStore($clock);

@@ -1841,6 +1841,18 @@ final class PostgresIdentityStore implements IdentityStore
                     'pat.expires_in_past',
                 );
             }
+            // security-audit-v0.3.md H1: 365-day cap from ADR 0016 §"Constraints".
+            if (
+                $expiresAt !== null
+                && ($expiresAt->getTimestamp() - $now->getTimestamp())
+                    > \Flametrench\Identity\Pat\PatLimits::MAX_LIFETIME_SECONDS
+            ) {
+                $maxSec = \Flametrench\Identity\Pat\PatLimits::MAX_LIFETIME_SECONDS;
+                throw new PreconditionException(
+                    "PAT expires_at exceeds the spec cap of {$maxSec} seconds (365 days) from creation",
+                    'pat.expires_too_far',
+                );
+            }
             $patId = Id::generate('pat');
             $secretBytes = random_bytes(32);
             $secretSegment = self::base64UrlEncode($secretBytes);
