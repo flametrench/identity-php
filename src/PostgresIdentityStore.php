@@ -12,10 +12,16 @@ use Flametrench\Identity\Exceptions\CredentialNotActiveException;
 use Flametrench\Identity\Exceptions\CredentialTypeMismatchException;
 use Flametrench\Identity\Exceptions\DuplicateCredentialException;
 use Flametrench\Identity\Exceptions\InvalidCredentialException;
+use Flametrench\Identity\Exceptions\InvalidPatTokenException;
 use Flametrench\Identity\Exceptions\InvalidTokenException;
 use Flametrench\Identity\Exceptions\NotFoundException;
+use Flametrench\Identity\Exceptions\PatExpiredException;
+use Flametrench\Identity\Exceptions\PatRevokedException;
 use Flametrench\Identity\Exceptions\PreconditionException;
 use Flametrench\Identity\Exceptions\SessionExpiredException;
+use Flametrench\Identity\Pat\PersonalAccessToken;
+use Flametrench\Identity\Pat\PatStatus;
+use Flametrench\Identity\Pat\VerifiedPat;
 use Flametrench\Identity\Mfa\FactorStatus;
 use Flametrench\Identity\Mfa\FactorType;
 use Flametrench\Identity\Mfa\MfaProof;
@@ -76,14 +82,28 @@ final class PostgresIdentityStore implements IdentityStore
         . 'recovery_hashes, recovery_consumed, pending_expires_at, '
         . 'created_at, updated_at';
 
+    private const PAT_COLS =
+        'id, usr_id, name, scope, secret_hash, expires_at, last_used_at, '
+        . 'revoked_at, created_at, updated_at';
+
     /** @var callable(): \DateTimeImmutable */
     private $clock;
+
+    /**
+     * Coalescing window for `last_used_at` writes on verifyPatToken
+     * (ADR 0016 §"Operational notes"). Within the window, repeated
+     * successful verifies of the same PAT do NOT write back to the
+     * row. 0 disables coalescing (always update). Default 60s.
+     */
+    private readonly int $patLastUsedCoalesceSeconds;
 
     public function __construct(
         private readonly PDO $pdo,
         ?callable $clock = null,
+        int $patLastUsedCoalesceSeconds = 60,
     ) {
         $this->clock = $clock ?? static fn(): \DateTimeImmutable => new \DateTimeImmutable();
+        $this->patLastUsedCoalesceSeconds = max(0, $patLastUsedCoalesceSeconds);
     }
 
     private function now(): \DateTimeImmutable
@@ -1784,5 +1804,284 @@ final class PostgresIdentityStore implements IdentityStore
                 'pending_factor_expired',
             );
         }
+    }
+
+    // ─── v0.3 personal access tokens (ADR 0016) ───
+
+    public function createPat(
+        string $usrId,
+        string $name,
+        array $scope = [],
+        ?\DateTimeImmutable $expiresAt = null,
+    ): array {
+        return $this->nested(function () use ($usrId, $name, $scope, $expiresAt): array {
+            // Validate user exists + active.
+            $stmt = $this->pdo->prepare('SELECT status FROM usr WHERE id = ? FOR UPDATE');
+            $stmt->execute([self::wireToUuid($usrId)]);
+            $row = $stmt->fetch(PDO::FETCH_ASSOC);
+            if ($row === false) {
+                throw new NotFoundException("User {$usrId} not found");
+            }
+            if ($row['status'] === 'revoked') {
+                throw new AlreadyTerminalException(
+                    "User {$usrId} is revoked; cannot issue PATs",
+                );
+            }
+            $nameLen = strlen($name);
+            if ($nameLen < 1 || $nameLen > 120) {
+                throw new PreconditionException(
+                    "PAT name must be 1–120 characters (got {$nameLen})",
+                    'pat.name_invalid',
+                );
+            }
+            $now = $this->now();
+            if ($expiresAt !== null && $expiresAt <= $now) {
+                throw new PreconditionException(
+                    'PAT expires_at must be strictly in the future',
+                    'pat.expires_in_past',
+                );
+            }
+            $patId = Id::generate('pat');
+            $secretBytes = random_bytes(32);
+            $secretSegment = self::base64UrlEncode($secretBytes);
+            $idHexSegment = substr($patId, 4);
+            $token = "pat_{$idHexSegment}_{$secretSegment}";
+            $secretHash = PasswordHashing::hash($secretSegment);
+            $scopeList = array_values($scope);
+
+            $insert = $this->pdo->prepare(
+                'INSERT INTO pat (id, usr_id, name, scope, secret_hash, expires_at, '
+                . 'last_used_at, revoked_at, created_at, updated_at) '
+                . 'VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?) '
+                . 'RETURNING ' . self::PAT_COLS,
+            );
+            $insert->execute([
+                self::wireToUuid($patId),
+                self::wireToUuid($usrId),
+                $name,
+                self::encodePgTextArray($scopeList),
+                $secretHash,
+                $expiresAt !== null ? self::fmt($expiresAt) : null,
+                self::fmt($now),
+                self::fmt($now),
+            ]);
+            $patRow = $insert->fetch(PDO::FETCH_ASSOC);
+            if ($patRow === false) {
+                throw new \RuntimeException('createPat: INSERT did not return a row');
+            }
+            return [
+                'pat' => $this->rowToPat($patRow),
+                'token' => $token,
+            ];
+        });
+    }
+
+    public function getPat(string $patId): PersonalAccessToken
+    {
+        $stmt = $this->pdo->prepare(
+            'SELECT ' . self::PAT_COLS . ' FROM pat WHERE id = ?'
+        );
+        $stmt->execute([self::wireToUuid($patId)]);
+        $row = $stmt->fetch(PDO::FETCH_ASSOC);
+        if ($row === false) {
+            throw new NotFoundException("PAT {$patId} not found");
+        }
+        return $this->rowToPat($row);
+    }
+
+    public function listPatsForUser(
+        string $usrId,
+        ?string $cursor = null,
+        int $limit = 50,
+        ?PatStatus $status = null,
+    ): Page {
+        $limit = max(1, min($limit, 200));
+        $sql = 'SELECT ' . self::PAT_COLS . ' FROM pat WHERE usr_id = ?';
+        $params = [self::wireToUuid($usrId)];
+        if ($cursor !== null) {
+            $sql .= ' AND id > ?';
+            $params[] = self::wireToUuid($cursor);
+        }
+        // Status is derived (not stored) — filter the SQL accordingly.
+        if ($status !== null) {
+            $now = self::fmt($this->now());
+            switch ($status) {
+                case PatStatus::Revoked:
+                    $sql .= ' AND revoked_at IS NOT NULL';
+                    break;
+                case PatStatus::Expired:
+                    $sql .= ' AND revoked_at IS NULL AND expires_at IS NOT NULL AND expires_at <= ?';
+                    $params[] = $now;
+                    break;
+                case PatStatus::Active:
+                    $sql .= ' AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?)';
+                    $params[] = $now;
+                    break;
+            }
+        }
+        // limit+1 to know if there's a next page.
+        $sql .= ' ORDER BY id ASC LIMIT ?';
+        $params[] = $limit + 1;
+        $stmt = $this->pdo->prepare($sql);
+        foreach ($params as $i => $v) {
+            $type = is_int($v) ? PDO::PARAM_INT : PDO::PARAM_STR;
+            $stmt->bindValue($i + 1, $v, $type);
+        }
+        $stmt->execute();
+        $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
+        $hasMore = count($rows) > $limit;
+        if ($hasMore) array_pop($rows);
+        $data = array_map(fn(array $r) => $this->rowToPat($r), $rows);
+        $next = ($hasMore && count($data) > 0) ? end($data)->id : null;
+        return new Page(data: array_values($data), nextCursor: $next);
+    }
+
+    public function revokePat(string $patId): PersonalAccessToken
+    {
+        return $this->nested(function () use ($patId): PersonalAccessToken {
+            $stmt = $this->pdo->prepare(
+                'SELECT ' . self::PAT_COLS . ' FROM pat WHERE id = ? FOR UPDATE'
+            );
+            $stmt->execute([self::wireToUuid($patId)]);
+            $row = $stmt->fetch(PDO::FETCH_ASSOC);
+            if ($row === false) {
+                throw new NotFoundException("PAT {$patId} not found");
+            }
+            // Idempotent: already revoked → return existing.
+            if ($row['revoked_at'] !== null) {
+                return $this->rowToPat($row);
+            }
+            $now = $this->now();
+            $update = $this->pdo->prepare(
+                'UPDATE pat SET revoked_at = ?, updated_at = ? WHERE id = ? RETURNING ' . self::PAT_COLS
+            );
+            $update->execute([
+                self::fmt($now),
+                self::fmt($now),
+                self::wireToUuid($patId),
+            ]);
+            $updated = $update->fetch(PDO::FETCH_ASSOC);
+            if ($updated === false) {
+                throw new \RuntimeException("revokePat: UPDATE did not return a row for {$patId}");
+            }
+            return $this->rowToPat($updated);
+        });
+    }
+
+    public function verifyPatToken(string $token): VerifiedPat
+    {
+        // Step 1–2: prefix + structural decode. Per ADR 0016 the format
+        // is pat_<32hex>_<base64url-secret>.
+        if (!str_starts_with($token, 'pat_')) {
+            throw new InvalidPatTokenException();
+        }
+        if (strlen($token) < 4 + 32 + 1 + 1) {
+            throw new InvalidPatTokenException();
+        }
+        $idHex = substr($token, 4, 32);
+        if (!ctype_xdigit($idHex)) {
+            throw new InvalidPatTokenException();
+        }
+        if ($token[36] !== '_') {
+            throw new InvalidPatTokenException();
+        }
+        $secretSegment = substr($token, 37);
+        if ($secretSegment === '') {
+            throw new InvalidPatTokenException();
+        }
+        $patId = "pat_{$idHex}";
+
+        // Step 3: lookup by id. wireToUuid may raise if the structurally-
+        // valid 32hex segment isn't a real UUID (wrong version nibble,
+        // bad RFC 4122 variant) — that's still "invalid token" for
+        // timing-oracle purposes, so we conflate the error class.
+        try {
+            $uuid = self::wireToUuid($patId);
+        } catch (\Throwable) {
+            throw new InvalidPatTokenException();
+        }
+        $stmt = $this->pdo->prepare(
+            'SELECT ' . self::PAT_COLS . ' FROM pat WHERE id = ?'
+        );
+        $stmt->execute([$uuid]);
+        $row = $stmt->fetch(PDO::FETCH_ASSOC);
+
+        // Step 4: missing row → conflated InvalidPatTokenException.
+        if ($row === false) {
+            throw new InvalidPatTokenException();
+        }
+        // Step 5: revoked terminal check.
+        if ($row['revoked_at'] !== null) {
+            throw new PatRevokedException($patId);
+        }
+        // Step 6: expiry.
+        $now = $this->now();
+        if ($row['expires_at'] !== null) {
+            $expiresAt = new \DateTimeImmutable((string) $row['expires_at']);
+            if ($expiresAt <= $now) {
+                throw new PatExpiredException($patId);
+            }
+        }
+        // Step 7: Argon2id verify; conflated error shape.
+        if (!PasswordHashing::verify((string) $row['secret_hash'], $secretSegment)) {
+            throw new InvalidPatTokenException();
+        }
+        // Step 8: last_used_at update with coalescing.
+        $persistedAt = $row['last_used_at'] !== null
+            ? new \DateTimeImmutable((string) $row['last_used_at'])
+            : null;
+        $shouldUpdate = $persistedAt === null
+            || $this->patLastUsedCoalesceSeconds === 0
+            || ($now->getTimestamp() - $persistedAt->getTimestamp()) >= $this->patLastUsedCoalesceSeconds;
+        if ($shouldUpdate) {
+            $upd = $this->pdo->prepare('UPDATE pat SET last_used_at = ? WHERE id = ?');
+            $upd->execute([self::fmt($now), self::wireToUuid($patId)]);
+        }
+
+        $scope = self::parsePgTextArray($row['scope']);
+        return new VerifiedPat(
+            patId: $patId,
+            usrId: Id::encode('usr', (string) $row['usr_id']),
+            scope: $scope,
+        );
+    }
+
+    /** @param array<string, mixed> $r */
+    private function rowToPat(array $r): PersonalAccessToken
+    {
+        $now = $this->now();
+        $expiresAt = $r['expires_at'] !== null
+            ? new \DateTimeImmutable((string) $r['expires_at'])
+            : null;
+        $revokedAt = $r['revoked_at'] !== null
+            ? new \DateTimeImmutable((string) $r['revoked_at'])
+            : null;
+        if ($revokedAt !== null) {
+            $status = PatStatus::Revoked;
+        } elseif ($expiresAt !== null && $expiresAt <= $now) {
+            $status = PatStatus::Expired;
+        } else {
+            $status = PatStatus::Active;
+        }
+        return new PersonalAccessToken(
+            id: Id::encode('pat', (string) $r['id']),
+            usrId: Id::encode('usr', (string) $r['usr_id']),
+            name: (string) $r['name'],
+            scope: self::parsePgTextArray($r['scope']),
+            status: $status,
+            expiresAt: $expiresAt,
+            lastUsedAt: $r['last_used_at'] !== null
+                ? new \DateTimeImmutable((string) $r['last_used_at'])
+                : null,
+            revokedAt: $revokedAt,
+            createdAt: new \DateTimeImmutable((string) $r['created_at']),
+            updatedAt: new \DateTimeImmutable((string) $r['updated_at']),
+        );
+    }
+
+    /** RFC 4648 §5 base64url, no padding. Matches the spec wire format. */
+    private static function base64UrlEncode(string $buf): string
+    {
+        return rtrim(strtr(base64_encode($buf), '+/', '-_'), '=');
     }
 }

@@ -12,10 +12,16 @@ use Flametrench\Identity\Exceptions\CredentialNotActiveException;
 use Flametrench\Identity\Exceptions\CredentialTypeMismatchException;
 use Flametrench\Identity\Exceptions\DuplicateCredentialException;
 use Flametrench\Identity\Exceptions\InvalidCredentialException;
+use Flametrench\Identity\Exceptions\InvalidPatTokenException;
 use Flametrench\Identity\Exceptions\InvalidTokenException;
 use Flametrench\Identity\Exceptions\NotFoundException;
+use Flametrench\Identity\Exceptions\PatExpiredException;
+use Flametrench\Identity\Exceptions\PatRevokedException;
 use Flametrench\Identity\Exceptions\PreconditionException;
 use Flametrench\Identity\Exceptions\SessionExpiredException;
+use Flametrench\Identity\Pat\PersonalAccessToken;
+use Flametrench\Identity\Pat\PatStatus;
+use Flametrench\Identity\Pat\VerifiedPat;
 use Flametrench\Ids\Id;
 
 /**
@@ -57,12 +63,37 @@ final class InMemoryIdentityStore implements IdentityStore
     /** @var array<string, string> token-hash → sesId. */
     private array $sessionByTokenHash = [];
 
+    /** @var array<string, PersonalAccessToken> patId → public PAT record. */
+    private array $pats = [];
+
+    /** @var array<string, string> patId → PHC-encoded Argon2id hash of the secret segment. */
+    private array $patSecretHashes = [];
+
+    /**
+     * @var array<string, \DateTimeImmutable> patId → most recent persisted last_used_at.
+     * Used by the coalescing window per ADR 0016 §"Operational notes".
+     */
+    private array $patLastUsedPersisted = [];
+
     /** @var callable(): \DateTimeImmutable */
     private $clock;
 
-    public function __construct(?callable $clock = null)
-    {
+    /**
+     * Coalescing window for `last_used_at` writes on verifyPatToken
+     * (ADR 0016). Within the window, repeated successful verifies of
+     * the same PAT do NOT update last_used_at on the public record;
+     * outside the window, the next verify updates it. 0 disables
+     * coalescing (always update). Default 60s matches the spec
+     * recommendation.
+     */
+    private readonly int $patLastUsedCoalesceSeconds;
+
+    public function __construct(
+        ?callable $clock = null,
+        int $patLastUsedCoalesceSeconds = 60,
+    ) {
         $this->clock = $clock ?? static fn(): \DateTimeImmutable => new \DateTimeImmutable();
+        $this->patLastUsedCoalesceSeconds = max(0, $patLastUsedCoalesceSeconds);
     }
 
     private function now(): \DateTimeImmutable
@@ -1154,5 +1185,226 @@ final class InMemoryIdentityStore implements IdentityStore
             $out .= $alphabet[($value << (5 - $bits)) & 0x1F];
         }
         return $out;
+    }
+
+    // ─── v0.3 personal access tokens (ADR 0016) ───
+
+    public function createPat(
+        string $usrId,
+        string $name,
+        array $scope = [],
+        ?\DateTimeImmutable $expiresAt = null,
+    ): array {
+        $u = $this->requireUser($usrId);
+        if ($u->status === Status::Revoked) {
+            throw new AlreadyTerminalException(
+                "User {$usrId} is revoked; cannot issue PATs",
+            );
+        }
+        $nameLen = strlen($name);
+        if ($nameLen < 1 || $nameLen > 120) {
+            throw new PreconditionException(
+                "PAT name must be 1–120 characters (got {$nameLen})",
+                'pat.name_invalid',
+            );
+        }
+        $now = $this->now();
+        if ($expiresAt !== null && $expiresAt <= $now) {
+            throw new PreconditionException(
+                'PAT expires_at must be strictly in the future',
+                'pat.expires_in_past',
+            );
+        }
+        $patId = Id::generate('pat');
+        $secretBytes = random_bytes(32);
+        $secretSegment = self::base64UrlEncode($secretBytes);
+        $idHexSegment = substr($patId, 4); // strip 'pat_' to get 32 hex chars
+        $token = "pat_{$idHexSegment}_{$secretSegment}";
+        $secretHash = PasswordHashing::hash($secretSegment);
+
+        $pat = new PersonalAccessToken(
+            id: $patId,
+            usrId: $usrId,
+            name: $name,
+            scope: array_values($scope),
+            status: PatStatus::Active,
+            expiresAt: $expiresAt,
+            lastUsedAt: null,
+            revokedAt: null,
+            createdAt: $now,
+            updatedAt: $now,
+        );
+        $this->pats[$patId] = $pat;
+        $this->patSecretHashes[$patId] = $secretHash;
+        return ['pat' => $pat, 'token' => $token];
+    }
+
+    public function getPat(string $patId): PersonalAccessToken
+    {
+        $pat = $this->pats[$patId] ?? throw new NotFoundException("PAT {$patId} not found");
+        return $this->withDerivedStatus($pat);
+    }
+
+    public function listPatsForUser(
+        string $usrId,
+        ?string $cursor = null,
+        int $limit = 50,
+        ?PatStatus $status = null,
+    ): Page {
+        $limit = max(1, min($limit, 200));
+        $matching = [];
+        foreach ($this->pats as $pat) {
+            if ($pat->usrId !== $usrId) continue;
+            $derived = $this->withDerivedStatus($pat);
+            if ($status !== null && $derived->status !== $status) continue;
+            $matching[] = $derived;
+        }
+        usort($matching, fn(PersonalAccessToken $a, PersonalAccessToken $b) => strcmp($a->id, $b->id));
+        if ($cursor !== null) {
+            $startIdx = 0;
+            foreach ($matching as $i => $item) {
+                if ($item->id > $cursor) { $startIdx = $i; break; }
+                $startIdx = $i + 1;
+            }
+        } else {
+            $startIdx = 0;
+        }
+        $slice = array_slice($matching, $startIdx, $limit);
+        $next = ($startIdx + $limit) < count($matching) && count($slice) > 0
+            ? $slice[count($slice) - 1]->id
+            : null;
+        return new Page(data: $slice, nextCursor: $next);
+    }
+
+    public function revokePat(string $patId): PersonalAccessToken
+    {
+        $pat = $this->pats[$patId] ?? throw new NotFoundException("PAT {$patId} not found");
+        if ($pat->revokedAt !== null) {
+            // Idempotent: already revoked.
+            return $this->withDerivedStatus($pat);
+        }
+        $now = $this->now();
+        $updated = new PersonalAccessToken(
+            id: $pat->id,
+            usrId: $pat->usrId,
+            name: $pat->name,
+            scope: $pat->scope,
+            status: PatStatus::Revoked,
+            expiresAt: $pat->expiresAt,
+            lastUsedAt: $pat->lastUsedAt,
+            revokedAt: $now,
+            createdAt: $pat->createdAt,
+            updatedAt: $now,
+        );
+        $this->pats[$patId] = $updated;
+        return $updated;
+    }
+
+    public function verifyPatToken(string $token): VerifiedPat
+    {
+        // Step 1–2: prefix inspection + split.
+        // Format: pat_<32hex>_<base64url-secret>. The first underscore
+        // after `pat_<32hex>` separates id from secret.
+        if (!str_starts_with($token, 'pat_')) {
+            throw new InvalidPatTokenException();
+        }
+        if (strlen($token) < 4 + 32 + 1 + 1) {
+            throw new InvalidPatTokenException();
+        }
+        $idHex = substr($token, 4, 32);
+        if (!ctype_xdigit($idHex)) {
+            throw new InvalidPatTokenException();
+        }
+        if ($token[36] !== '_') {
+            throw new InvalidPatTokenException();
+        }
+        $secretSegment = substr($token, 37);
+        if ($secretSegment === '') {
+            throw new InvalidPatTokenException();
+        }
+        $patId = "pat_{$idHex}";
+
+        // Step 3–4: lookup; conflate "no row" with "wrong secret".
+        $pat = $this->pats[$patId] ?? null;
+        if ($pat === null) {
+            throw new InvalidPatTokenException();
+        }
+
+        // Step 5: revoked terminal check.
+        if ($pat->revokedAt !== null) {
+            throw new PatRevokedException($patId);
+        }
+        // Step 6: expiry check.
+        $now = $this->now();
+        if ($pat->expiresAt !== null && $pat->expiresAt <= $now) {
+            throw new PatExpiredException($patId);
+        }
+        // Step 7: Argon2id verify; conflated error shape.
+        $hash = $this->patSecretHashes[$patId] ?? null;
+        if ($hash === null || !PasswordHashing::verify($hash, $secretSegment)) {
+            throw new InvalidPatTokenException();
+        }
+        // Step 8: last_used_at update with coalescing.
+        $persisted = $this->patLastUsedPersisted[$patId] ?? null;
+        $shouldUpdate = $persisted === null
+            || $this->patLastUsedCoalesceSeconds === 0
+            || ($now->getTimestamp() - $persisted->getTimestamp()) >= $this->patLastUsedCoalesceSeconds;
+        if ($shouldUpdate) {
+            $this->pats[$patId] = new PersonalAccessToken(
+                id: $pat->id,
+                usrId: $pat->usrId,
+                name: $pat->name,
+                scope: $pat->scope,
+                status: $pat->status,
+                expiresAt: $pat->expiresAt,
+                lastUsedAt: $now,
+                revokedAt: $pat->revokedAt,
+                createdAt: $pat->createdAt,
+                updatedAt: $now,
+            );
+            $this->patLastUsedPersisted[$patId] = $now;
+        }
+        return new VerifiedPat(
+            patId: $patId,
+            usrId: $pat->usrId,
+            scope: $pat->scope,
+        );
+    }
+
+    /**
+     * Returns a copy of the row with the status field derived from
+     * lifecycle columns (revoked_at / expires_at / now). The persisted
+     * status is what was set at write time; reads always re-derive.
+     */
+    private function withDerivedStatus(PersonalAccessToken $pat): PersonalAccessToken
+    {
+        if ($pat->revokedAt !== null) {
+            $derived = PatStatus::Revoked;
+        } elseif ($pat->expiresAt !== null && $pat->expiresAt <= $this->now()) {
+            $derived = PatStatus::Expired;
+        } else {
+            $derived = PatStatus::Active;
+        }
+        if ($derived === $pat->status) {
+            return $pat;
+        }
+        return new PersonalAccessToken(
+            id: $pat->id,
+            usrId: $pat->usrId,
+            name: $pat->name,
+            scope: $pat->scope,
+            status: $derived,
+            expiresAt: $pat->expiresAt,
+            lastUsedAt: $pat->lastUsedAt,
+            revokedAt: $pat->revokedAt,
+            createdAt: $pat->createdAt,
+            updatedAt: $pat->updatedAt,
+        );
+    }
+
+    /** RFC 4648 §5 base64url, no padding. Matches the spec wire format. */
+    private static function base64UrlEncode(string $buf): string
+    {
+        return rtrim(strtr(base64_encode($buf), '+/', '-_'), '=');
     }
 }

@@ -3,6 +3,25 @@
 All notable changes to `flametrench/identity` are recorded here.
 Spec-level changes live in [`spec/CHANGELOG.md`](https://github.com/flametrench/spec/blob/main/CHANGELOG.md).
 
+## [v0.3.0] — Unreleased
+
+### Added (personal access tokens, ADR 0016)
+- New `Flametrench\Identity\Pat\` namespace: `PersonalAccessToken` record, `PatStatus` enum, `VerifiedPat` verification result.
+- New exceptions: `InvalidPatTokenException`, `PatExpiredException`, `PatRevokedException`. The "no such row" and "wrong secret" cases conflate to `InvalidPatTokenException` to avoid a token-presence timing oracle (ADR 0016 §"Verification semantics").
+- New methods on `IdentityStore`: `createPat`, `getPat`, `listPatsForUser`, `revokePat`, `verifyPatToken`. Implemented in both `InMemoryIdentityStore` and `PostgresIdentityStore`.
+- Wire format: `pat_<32hex-id>_<base64url-secret>` (Stripe-style id-then-secret). The plaintext token is returned ONCE in the `createPat` result and never again — the server stores only an Argon2id hash of the secret segment at the cred-password parameter floor (m=19456, t=2, p=1).
+- New `patLastUsedCoalesceSeconds` constructor option on both stores (default 60s) to avoid a write-per-request hot path on the `last_used_at` column. 0 disables coalescing.
+- `PostgresIdentityStore` PAT methods cooperate with outer transactions via `SAVEPOINT/RELEASE` (ADR 0013).
+- Coverage: 21 in-memory tests + 17 Postgres integration tests.
+
+### Required dependency bump
+- `flametrench/ids` constraint now `^0.3.0` for the `pat` type prefix (ADR 0016).
+
+## [v0.2.0] — 2026-04-30
+
+### Released
+- v0.2 stable cutoff. No functional changes from `v0.2.0-rc.5` — same source, version bumped to drop the `-rc` suffix at the spec v0.2.0 freeze. Published to Packagist `^0.2.0` constraint.
+
 ## [v0.2.0-rc.5] — 2026-04-27
 
 ### Fixed (security posture)

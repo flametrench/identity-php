@@ -426,26 +426,6 @@ it('multiple SDK calls in one outer transaction commit-or-rollback together', fu
     expect(fn() => $this->store->getUser($b->id))->toThrow(NotFoundException::class);
 });
 
-/**
- * Convert a postgres:// URL into a PDO connection.
- */
-function identityPgPdoFromUrl(string $url): PDO
-{
-    $parts = parse_url($url);
-    if ($parts === false) {
-        throw new RuntimeException("invalid postgres URL: {$url}");
-    }
-    $host = $parts['host'] ?? '127.0.0.1';
-    $port = $parts['port'] ?? 5432;
-    $db = ltrim($parts['path'] ?? '/postgres', '/');
-    $user = $parts['user'] ?? 'postgres';
-    $pass = $parts['pass'] ?? '';
-    $dsn = "pgsql:host={$host};port={$port};dbname={$db}";
-    return new PDO($dsn, $user, $pass, [
-        PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
-    ]);
-}
-
 /** RFC 4648 base32 decode (uppercase, ignores padding). */
 function base32Decode(string $s): string
 {

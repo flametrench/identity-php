@@ -181,4 +181,69 @@ interface IdentityStore
         bool $required,
         ?\DateTimeImmutable $graceUntil = null,
     ): \Flametrench\Identity\Mfa\UserMfaPolicy;
+
+    // ─── v0.3 personal access tokens (ADR 0016) ───
+
+    /**
+     * Mint a new personal access token for the user.
+     *
+     * Returns a tuple of the persisted record and the plaintext bearer
+     * token in `pat_<32hex-id>_<base64url-secret>` form. The plaintext
+     * token is returned ONCE; the server retains only an Argon2id hash
+     * of the secret segment at the cred-password parameter floor.
+     * Adopters MUST surface the plaintext to the user immediately and
+     * never persist it server-side.
+     *
+     * Authorization gating is the adopter's responsibility — typically
+     * "the requesting principal owns $usrId, OR is a sysadmin acting on
+     * the user's behalf." The SDK does not enforce.
+     *
+     * @param  string                $usrId     Owner of the new token.
+     * @param  string                $name      Human-readable label, 1–120 chars.
+     * @param  list<string>          $scope     Application-defined scope claims; may be empty.
+     * @param  ?\DateTimeImmutable   $expiresAt Optional expiry. Null = no expiry.
+     * @return array{pat: \Flametrench\Identity\Pat\PersonalAccessToken, token: string}
+     */
+    public function createPat(
+        string $usrId,
+        string $name,
+        array $scope = [],
+        ?\DateTimeImmutable $expiresAt = null,
+    ): array;
+
+    public function getPat(string $patId): \Flametrench\Identity\Pat\PersonalAccessToken;
+
+    /**
+     * Cursor-paginated PAT list for a user. Mirrors the listMembers /
+     * listUsers pagination shape. Default returns all statuses; pass a
+     * specific PatStatus to filter.
+     *
+     * @return Page<\Flametrench\Identity\Pat\PersonalAccessToken>
+     */
+    public function listPatsForUser(
+        string $usrId,
+        ?string $cursor = null,
+        int $limit = 50,
+        ?\Flametrench\Identity\Pat\PatStatus $status = null,
+    ): Page;
+
+    /**
+     * Terminal-state revoke. Idempotent: revoking an already-revoked
+     * token returns the existing row unchanged.
+     */
+    public function revokePat(string $patId): \Flametrench\Identity\Pat\PersonalAccessToken;
+
+    /**
+     * Verify a PAT bearer token per ADR 0016 §"Verification semantics".
+     *
+     * Throws InvalidPatTokenException for malformed tokens, missing
+     * rows, or wrong-secret matches (the missing/wrong cases MUST
+     * conflate). Throws PatRevokedException for terminal-revoked
+     * tokens. Throws PatExpiredException for past-expiry tokens.
+     *
+     * On success, side-effect: updates the row's last_used_at column.
+     * Implementations MAY coalesce these writes within a configurable
+     * window (60s default) to avoid a write-per-request hot path.
+     */
+    public function verifyPatToken(string $token): \Flametrench\Identity\Pat\VerifiedPat;
 }
