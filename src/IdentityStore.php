@@ -200,6 +200,13 @@ interface IdentityStore
      * gating, any authenticated user can mint PATs in any other
      * user's name. (security-audit-v0.3.md H7.)
      *
+     * @security Adopter MUST gate calls on $scope. The SDK persists
+     * scope as opaque strings — it does NOT interpret them at
+     * verifyPatToken time. Unlike `tup.relation` (which check()
+     * enforces against the rule registry), scope is purely an audit
+     * tag unless the adopter's request handler reads VerifiedPat::$scope
+     * and gates the request. (security-audit-v0.3.md F5.)
+     *
      * @param  string                $usrId     Owner of the new token.
      * @param  string                $name      Human-readable label, 1–120 Unicode code units.
      * @param  list<string>          $scope     Application-defined scope claims; may be empty.

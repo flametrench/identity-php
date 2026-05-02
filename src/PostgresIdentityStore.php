@@ -208,10 +208,36 @@ final class PostgresIdentityStore implements IdentityStore
         }
     }
 
-    /** Read the immediate caller of the function that called this helper. */
+    /**
+     * Read the immediate caller of the function that called this helper.
+     *
+     * security-audit-v0.3.md L2: when a private helper (e.g.
+     * revokeOldOnRotation) calls nested(), the immediate caller of
+     * nested is the helper, not the public API method. Walk frames
+     * upward, skipping anything whose visibility is private or
+     * protected, until we hit the first public method — that is the
+     * surface adopters see in pg_stat_activity.
+     */
     private static function callerName(): string
     {
-        $bt = \debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS, 3);
+        $bt = \debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS, 12);
+        for ($i = 2; $i < count($bt); $i++) {
+            $frame = $bt[$i];
+            $fn = (string) ($frame['function'] ?? '');
+            if ($fn === '') continue;
+            $class = $frame['class'] ?? null;
+            if ($class === null) {
+                return $fn;
+            }
+            try {
+                $rm = new \ReflectionMethod($class, $fn);
+                if ($rm->isPublic()) {
+                    return $fn;
+                }
+            } catch (\ReflectionException) {
+                return $fn;
+            }
+        }
         return (string) ($bt[2]['function'] ?? 'tx');
     }
 
@@ -222,7 +248,8 @@ final class PostgresIdentityStore implements IdentityStore
         if ($method === '') {
             $method = 'tx';
         }
-        return 'ft_' . $method . '_' . bin2hex(random_bytes(4));
+        // security-audit-v0.3.md L1: 8 bytes — see PostgresTupleStore.
+        return 'ft_' . $method . '_' . bin2hex(random_bytes(8));
     }
 
     private static function isUniqueViolation(PDOException $e): bool
