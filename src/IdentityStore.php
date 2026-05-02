@@ -194,12 +194,14 @@ interface IdentityStore
      * Adopters MUST surface the plaintext to the user immediately and
      * never persist it server-side.
      *
-     * Authorization gating is the adopter's responsibility — typically
-     * "the requesting principal owns $usrId, OR is a sysadmin acting on
-     * the user's behalf." The SDK does not enforce.
+     * @security Adopter MUST gate this call so the requesting
+     * principal either owns $usrId OR is a sysadmin acting on the
+     * user's behalf. The SDK does not enforce. Without route-layer
+     * gating, any authenticated user can mint PATs in any other
+     * user's name. (security-audit-v0.3.md H7.)
      *
      * @param  string                $usrId     Owner of the new token.
-     * @param  string                $name      Human-readable label, 1–120 chars.
+     * @param  string                $name      Human-readable label, 1–120 Unicode code units.
      * @param  list<string>          $scope     Application-defined scope claims; may be empty.
      * @param  ?\DateTimeImmutable   $expiresAt Optional expiry. Null = no expiry.
      * @return array{pat: \Flametrench\Identity\Pat\PersonalAccessToken, token: string}
@@ -211,12 +213,23 @@ interface IdentityStore
         ?\DateTimeImmutable $expiresAt = null,
     ): array;
 
+    /**
+     * @security Adopter MUST gate so the requesting principal either
+     * owns the PAT (matches usrId of the row) OR is a sysadmin. The
+     * SDK returns the row regardless — without gating an unauth /
+     * wrong-principal request leaks the PAT's existence, scope, and
+     * metadata. (security-audit-v0.3.md H7.)
+     */
     public function getPat(string $patId): \Flametrench\Identity\Pat\PersonalAccessToken;
 
     /**
      * Cursor-paginated PAT list for a user. Mirrors the listMembers /
      * listUsers pagination shape. Default returns all statuses; pass a
      * specific PatStatus to filter.
+     *
+     * @security Adopter MUST gate so the requesting principal either
+     * is $usrId OR is a sysadmin. Without gating, any caller can
+     * enumerate any user's PATs. (security-audit-v0.3.md H7.)
      *
      * @return Page<\Flametrench\Identity\Pat\PersonalAccessToken>
      */
@@ -230,6 +243,11 @@ interface IdentityStore
     /**
      * Terminal-state revoke. Idempotent: revoking an already-revoked
      * token returns the existing row unchanged.
+     *
+     * @security Adopter MUST gate so the requesting principal either
+     * owns the PAT OR is a sysadmin. Without gating, any caller can
+     * revoke any user's PAT — locking the legitimate owner out of
+     * their own automation. (security-audit-v0.3.md H7.)
      */
     public function revokePat(string $patId): \Flametrench\Identity\Pat\PersonalAccessToken;
 
