@@ -56,6 +56,20 @@ describe('createPat', function () {
         $store->createPat($u->id, name: str_repeat('x', 121), scope: []);
     })->throws(PreconditionException::class);
 
+    // security-audit-v0.3.md H4: PHP must count Unicode code units,
+    // not UTF-8 bytes. A 60-char Japanese name is 60 code units (180
+    // bytes) — pre-fix PHP rejected it via strlen() while Node /
+    // Python / Java accepted it. Cross-SDK conformance break.
+    it('accepts a 60-char Japanese name (180 UTF-8 bytes)', function () {
+        $clock = new \DateTimeImmutable('2026-05-01T12:00:00Z');
+        $store = makeStore($clock);
+        $u = $store->createUser();
+        // 60 hiragana characters = 180 UTF-8 bytes.
+        $name = str_repeat('あ', 60);
+        $r = $store->createPat($u->id, name: $name, scope: []);
+        expect($r['pat']->name)->toBe($name);
+    });
+
     it('rejects an expires_at in the past', function () {
         $clock = new \DateTimeImmutable('2026-05-01T12:00:00Z');
         $store = makeStore($clock);

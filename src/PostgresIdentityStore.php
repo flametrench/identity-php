@@ -1827,7 +1827,8 @@ final class PostgresIdentityStore implements IdentityStore
                     "User {$usrId} is revoked; cannot issue PATs",
                 );
             }
-            $nameLen = strlen($name);
+            // security-audit-v0.3.md H4: count Unicode code units, not bytes
+        $nameLen = mb_strlen($name, 'UTF-8');
             if ($nameLen < 1 || $nameLen > 120) {
                 throw new PreconditionException(
                     "PAT name must be 1–120 characters (got {$nameLen})",
