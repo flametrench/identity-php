@@ -38,5 +38,14 @@ final class PatLimits
      */
     public const DUMMY_PHC_HASH = '$argon2id$v=19$m=19456,t=2,p=1$779z4UHkLWR4w0TEo9gcHg$Gz0+nGnpokhsKi1cPlx8i74FBN1Nq0OURZ3xso1AHMU';
 
+    /**
+     * security-audit-v0.3.md H6 — pre-rejection cap on the
+     * secret-segment length to defend against Argon2 DoS
+     * amplification. Real PAT secrets are 43 chars (32 random
+     * bytes base64url-encoded); 256 leaves a generous margin
+     * while bounding the attack.
+     */
+    public const MAX_SECRET_LENGTH = 256;
+
     private function __construct() {}
 }

@@ -1332,7 +1332,11 @@ final class InMemoryIdentityStore implements IdentityStore
             throw new InvalidPatTokenException();
         }
         $secretSegment = substr($token, 37);
-        if ($secretSegment === '') {
+        // security-audit-v0.3.md H6: cap on secret-segment length so an
+        // attacker with a known pat_id cannot force unbounded Argon2id
+        // work by submitting MB-sized secrets. Real PAT secrets are
+        // 43 chars; 256 is generous.
+        if ($secretSegment === '' || strlen($secretSegment) > \Flametrench\Identity\Pat\PatLimits::MAX_SECRET_LENGTH) {
             throw new InvalidPatTokenException();
         }
         $patId = "pat_{$idHex}";
