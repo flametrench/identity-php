@@ -657,6 +657,50 @@ CREATE TRIGGER mfa_touch              BEFORE UPDATE ON mfa
 CREATE TRIGGER usr_mfa_policy_touch   BEFORE UPDATE ON usr_mfa_policy
     FOR EACH ROW EXECUTE FUNCTION flametrench_touch_updated_at();
 
+-- ===========================================================================
+-- v0.3: pat (personal access tokens — ADR 0016)
+-- ===========================================================================
+
+CREATE TABLE pat (
+    id            UUID PRIMARY KEY,
+    usr_id        UUID NOT NULL REFERENCES usr(id),
+    name          TEXT NOT NULL,
+
+    -- Application-defined scope claims. The spec does not pin
+    -- vocabulary; adopters' authz layer interprets the strings.
+    scope         TEXT[] NOT NULL DEFAULT '{}',
+
+    -- PHC-encoded Argon2id hash of the base64url secret segment.
+    -- The plaintext secret leaves the server exactly once (createPat).
+    secret_hash   TEXT NOT NULL,
+
+    expires_at    TIMESTAMPTZ,
+    last_used_at  TIMESTAMPTZ,
+    revoked_at    TIMESTAMPTZ,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    CHECK (expires_at   IS NULL OR expires_at   > created_at),
+    CHECK (last_used_at IS NULL OR last_used_at >= created_at),
+    CHECK (revoked_at   IS NULL OR revoked_at   >= created_at),
+    CHECK (length(name) BETWEEN 1 AND 120)
+);
+
+-- "List PATs for this user" — primary enumeration path.
+CREATE INDEX pat_usr_idx ON pat (usr_id, created_at DESC);
+
+-- "Active PATs only" — speeds up status='active' filter on the list path.
+CREATE INDEX pat_usr_active_idx ON pat (usr_id, created_at DESC)
+    WHERE revoked_at IS NULL;
+
+-- "Sweep expired PATs" — operational cleanup; not on the verify hot path.
+CREATE INDEX pat_expires_idx ON pat (expires_at)
+    WHERE revoked_at IS NULL AND expires_at IS NOT NULL;
+
+-- v0.3:
+CREATE TRIGGER pat_touch              BEFORE UPDATE ON pat
+    FOR EACH ROW EXECUTE FUNCTION flametrench_touch_updated_at();
+
 -- ses, inv, and tup are append-only / lifecycle-terminal; no updated_at.
 -- Changes to these entities happen via inserts (rotation) or via
 -- specific terminal-state updates (inv accept/decline/revoke), not
