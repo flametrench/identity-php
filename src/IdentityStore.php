@@ -181,4 +181,37 @@ interface IdentityStore
         bool $required,
         ?\DateTimeImmutable $graceUntil = null,
     ): \Flametrench\Identity\Mfa\UserMfaPolicy;
+
+    // ─── v0.3 PAT store operations (ADR 0016) ───
+
+    /**
+     * Mint a new PAT for $usrId.  Returns the persisted record AND the
+     * one-time plaintext bearer token.  The token is NEVER stored in
+     * plaintext; after this call the only copy is what you return to the
+     * end user.
+     *
+     * @param  list<string>  $scope
+     */
+    public function createPat(
+        string $usrId,
+        string $name,
+        array $scope = [],
+        ?\DateTimeImmutable $expiresAt = null,
+    ): CreatePatResult;
+
+    public function getPat(string $patId): PersonalAccessToken;
+
+    /** @return Page<PersonalAccessToken> */
+    public function listPatsForUser(string $usrId, ?string $cursor = null, int $limit = 50): Page;
+
+    /**
+     * Verify a PAT bearer token per ADR 0016 §"Verification semantics".
+     *
+     * @throws \Flametrench\Identity\Exceptions\InvalidPatTokenException  structural/lookup/secret failure
+     * @throws \Flametrench\Identity\Exceptions\PatRevokedException        revoked_at is non-null
+     * @throws \Flametrench\Identity\Exceptions\PatExpiredException        expires_at <= now
+     */
+    public function verifyPatToken(string $token): VerifiedPat;
+
+    public function revokePat(string $patId): PersonalAccessToken;
 }

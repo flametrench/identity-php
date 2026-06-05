@@ -19,11 +19,18 @@
 
 declare(strict_types=1);
 
+use Flametrench\Identity\AuthKind;
+use Flametrench\Identity\Exceptions\AlreadyTerminalException;
+use Flametrench\Identity\Exceptions\NotFoundException;
 use Flametrench\Identity\Exceptions\WebAuthnException;
+use Flametrench\Identity\IdentityStore;
+use Flametrench\Identity\InMemoryIdentityStore;
 use Flametrench\Identity\Mfa\RecoveryCodes;
 use Flametrench\Identity\Mfa\Totp;
 use Flametrench\Identity\Mfa\WebAuthn;
 use Flametrench\Identity\PasswordHashing;
+use Flametrench\Identity\Pat;
+use Flametrench\Identity\Status;
 
 const IDENTITY_FIXTURES_DIR = __DIR__ . '/conformance/fixtures';
 
@@ -150,3 +157,252 @@ foreach (
         },
     );
 }
+
+// ─── v0.3: identity.verify_pat_token — structural validation ───
+
+describe(
+    'Conformance · identity.verify_pat_token [MUST] · token-format',
+    function () {
+        $fixture = loadIdentityFixture('identity/pat/token-format.json');
+        foreach ($fixture['tests'] as $t) {
+            it("[{$t['id']}] {$t['description']}", function () use ($t) {
+                expect(Pat::isStructurallyValid($t['input']['token']))
+                    ->toBe($t['expected']['result']);
+            });
+        }
+    },
+);
+
+// ─── v0.3: identity.resolve_bearer — bearer-prefix routing ───
+
+describe(
+    'Conformance · identity.resolve_bearer [MUST] · bearer-prefix-routing',
+    function () {
+        $fixture = loadIdentityFixture('identity/pat/bearer-prefix-routing.json');
+        foreach ($fixture['tests'] as $t) {
+            it("[{$t['id']}] {$t['description']}", function () use ($t) {
+                expect(Pat::classifyBearer($t['input']['token'])->value)
+                    ->toBe($t['expected']['result']);
+            });
+        }
+    },
+);
+
+// ─── v0.2: identity.update_user (ADR 0014 — display name) ───
+
+/**
+ * Error label → PHP exception class for the step-based DSL.
+ *
+ * @return class-string<\Throwable>
+ */
+function resolveIdentityError(string $label): string
+{
+    return match ($label) {
+        'AlreadyTerminalError' => AlreadyTerminalException::class,
+        'NotFoundError'        => NotFoundException::class,
+        default                => \RuntimeException::class,
+    };
+}
+
+/**
+ * Interpolate `{varName}` tokens in a string using the current capture map.
+ *
+ * @param array<string,string> $captures
+ */
+function interpolate(string $value, array $captures): string
+{
+    return preg_replace_callback('/\{([^}]+)\}/', function ($m) use ($captures) {
+        return $captures[$m[1]] ?? $m[0];
+    }, $value);
+}
+
+/**
+ * Run a step-DSL test case (used by both update_user and list_users fixtures).
+ *
+ * @param array<string,mixed>  $testCase   One entry from fixture['tests']
+ * @param InMemoryIdentityStore $store
+ */
+function runStepFixture(array $testCase, InMemoryIdentityStore $store): void
+{
+    $captures = [];
+
+    foreach ($testCase['steps'] as $step) {
+        $op    = $step['op'];
+        $input = $step['input'] ?? [];
+
+        // Interpolate all string values in $input.
+        $resolved = [];
+        foreach ($input as $k => $v) {
+            $resolved[$k] = is_string($v) ? interpolate($v, $captures) : $v;
+        }
+
+        $expectedError = $step['expected']['error'] ?? null;
+
+        try {
+            $result = executeIdentityStep($op, $resolved, $store);
+        } catch (\Throwable $e) {
+            if ($expectedError !== null) {
+                expect($e)->toBeInstanceOf(resolveIdentityError($expectedError));
+                continue;
+            }
+            throw $e;
+        }
+
+        if ($expectedError !== null) {
+            // Expected an exception but none was thrown.
+            expect(false)->toBeTrue("Expected {$expectedError} from op {$op} but no exception was thrown");
+        }
+
+        // Capture values.
+        foreach ($step['captures'] ?? [] as $captureKey => $capturePath) {
+            $parts = explode('.', $capturePath, 2);
+            $captures[$captureKey] = match ($parts[0]) {
+                'user'       => $result['user']->{$parts[1]},
+                'credential' => $result['credential']->{$parts[1]},
+                'page'       => $result['page']->{lcfirst(str_replace('_', '', ucwords($parts[1], '_')))},
+                default      => $result[$parts[0]],
+            };
+        }
+
+        // Assertions.
+        $expected = $step['expected'] ?? [];
+        assertIdentityStepExpected($expected, $result, $captures);
+    }
+}
+
+/**
+ * Execute one step op and return a result bag.
+ *
+ * @param array<string,mixed>   $input
+ * @return array<string,mixed>
+ */
+function executeIdentityStep(string $op, array $input, InMemoryIdentityStore $store): array
+{
+    return match ($op) {
+        'create_user' => (function () use ($input, $store) {
+            $user = $store->createUser($input['display_name'] ?? null);
+            return ['user' => $user];
+        })(),
+
+        'create_user_with_password_credential' => (function () use ($input, $store) {
+            $user = $store->createUser();
+            $cred = $store->createPasswordCredential($user->id, $input['identifier'], $input['password']);
+            return ['user' => $user, 'credential' => $cred];
+        })(),
+
+        'suspend_user'       => ['user' => $store->suspendUser($input['usr_id'])],
+        'revoke_user'        => ['user' => $store->revokeUser($input['usr_id'])],
+        'reinstate_user'     => ['user' => $store->reinstateUser($input['usr_id'])],
+        'revoke_credential'  => ['credential' => $store->revokeCredential($input['cred_id'])],
+
+        'update_user' => (function () use ($input, $store) {
+            $displayName = array_key_exists('display_name', $input)
+                ? $input['display_name']
+                : IdentityStore::UNSET;
+            $user = $store->updateUser($input['usr_id'], $displayName);
+            return ['user' => $user];
+        })(),
+
+        'assert_user_fields' => (function () use ($input, $store) {
+            $user = $store->getUser($input['usr_id']);
+            if (array_key_exists('expected_display_name', $input)) {
+                expect($user->displayName)->toBe($input['expected_display_name']);
+            }
+            return ['user' => $user];
+        })(),
+
+        'list_users' => (function () use ($input, $store) {
+            $status = isset($input['status'])
+                ? Status::from($input['status'])
+                : null;
+            $page = $store->listUsers(
+                cursor: $input['cursor'] ?? null,
+                limit:  $input['limit']  ?? 50,
+                query:  $input['query']  ?? null,
+                status: $status,
+            );
+            return ['page' => $page];
+        })(),
+
+        default => throw new \RuntimeException("Unknown step op: {$op}"),
+    };
+}
+
+/**
+ * Assert step-level expected values that don't fit in the capture step.
+ *
+ * @param array<string,mixed>  $expected
+ * @param array<string,mixed>  $result
+ * @param array<string,string> $captures
+ */
+function assertIdentityStepExpected(array $expected, array $result, array $captures): void
+{
+    if (isset($expected['data_ids_in_order'])) {
+        $ids = array_map(
+            fn($id) => interpolate($id, $captures),
+            $expected['data_ids_in_order'],
+        );
+        $actual = array_map(fn($u) => $u->id, $result['page']->data);
+        expect($actual)->toBe($ids);
+    }
+
+    if (isset($expected['data_ids_unordered'])) {
+        $ids = array_map(
+            fn($id) => interpolate($id, $captures),
+            $expected['data_ids_unordered'],
+        );
+        $actual = array_map(fn($u) => $u->id, $result['page']->data);
+        sort($ids);
+        sort($actual);
+        expect($actual)->toBe($ids);
+    }
+
+    if (array_key_exists('next_cursor', $expected)) {
+        $expectedCursor = $expected['next_cursor'] !== null
+            ? interpolate($expected['next_cursor'], $captures)
+            : null;
+        expect($result['page']->nextCursor)->toBe($expectedCursor);
+    }
+
+    if (isset($expected['user_display_names'])) {
+        $actualMap = [];
+        foreach ($result['page']->data as $user) {
+            $actualMap[$user->id] = $user->displayName;
+        }
+        $expectedMap = [];
+        foreach ($expected['user_display_names'] as $rawId => $name) {
+            $resolvedId = interpolate($rawId, $captures);
+            $expectedMap[$resolvedId] = $name;
+        }
+        foreach ($expectedMap as $uid => $name) {
+            $actualValue = array_key_exists($uid, $actualMap) ? $actualMap[$uid] : 'MISSING';
+            expect($actualValue)->toBe($name);
+        }
+    }
+}
+
+describe(
+    'Conformance · identity.update_user [MUST] · user-display-name',
+    function () {
+        $fixture = loadIdentityFixture('identity/user-display-name.json');
+        foreach ($fixture['tests'] as $t) {
+            it("[{$t['id']}] {$t['description']}", function () use ($t) {
+                runStepFixture($t, new InMemoryIdentityStore());
+            });
+        }
+    },
+);
+
+// ─── v0.2: identity.list_users (ADR 0015) ───
+
+describe(
+    'Conformance · identity.list_users [MUST] · list-users',
+    function () {
+        $fixture = loadIdentityFixture('identity/list-users.json');
+        foreach ($fixture['tests'] as $t) {
+            it("[{$t['id']}] {$t['description']}", function () use ($t) {
+                runStepFixture($t, new InMemoryIdentityStore());
+            });
+        }
+    },
+);

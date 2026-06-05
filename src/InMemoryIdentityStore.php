@@ -12,8 +12,11 @@ use Flametrench\Identity\Exceptions\CredentialNotActiveException;
 use Flametrench\Identity\Exceptions\CredentialTypeMismatchException;
 use Flametrench\Identity\Exceptions\DuplicateCredentialException;
 use Flametrench\Identity\Exceptions\InvalidCredentialException;
+use Flametrench\Identity\Exceptions\InvalidPatTokenException;
 use Flametrench\Identity\Exceptions\InvalidTokenException;
 use Flametrench\Identity\Exceptions\NotFoundException;
+use Flametrench\Identity\Exceptions\PatExpiredException;
+use Flametrench\Identity\Exceptions\PatRevokedException;
 use Flametrench\Identity\Exceptions\PreconditionException;
 use Flametrench\Identity\Exceptions\SessionExpiredException;
 use Flametrench\Ids\Id;
@@ -56,6 +59,12 @@ final class InMemoryIdentityStore implements IdentityStore
 
     /** @var array<string, string> token-hash → sesId. */
     private array $sessionByTokenHash = [];
+
+    /** @var array<string, PersonalAccessToken> */
+    private array $pats = [];
+
+    /** @var array<string, string> patId → Argon2id PHC hash of the secret. */
+    private array $patSecretHashes = [];
 
     /** @var callable(): \DateTimeImmutable */
     private $clock;
@@ -251,6 +260,23 @@ final class InMemoryIdentityStore implements IdentityStore
             }
         }
         $this->cascadeRevokeSessionsForUser($usrId);
+        // Cascade: revoke active PATs owned by this user (ADR 0016).
+        foreach ($this->pats as $patId => $pat) {
+            if ($pat->usrId === $usrId && $pat->revokedAt === null) {
+                $this->pats[$patId] = new PersonalAccessToken(
+                    id: $pat->id,
+                    usrId: $pat->usrId,
+                    name: $pat->name,
+                    scope: $pat->scope,
+                    status: PatStatus::Revoked,
+                    expiresAt: $pat->expiresAt,
+                    lastUsedAt: $pat->lastUsedAt,
+                    revokedAt: $now,
+                    createdAt: $pat->createdAt,
+                    updatedAt: $now,
+                );
+            }
+        }
         $updated = $u->withStatus(Status::Revoked, $now);
         $this->users[$usrId] = $updated;
         return $updated;
@@ -1135,6 +1161,186 @@ final class InMemoryIdentityStore implements IdentityStore
                 'pending_factor_expired',
             );
         }
+    }
+
+    // ─── v0.3 PATs (ADR 0016) ───
+
+    public function createPat(
+        string $usrId,
+        string $name,
+        array $scope = [],
+        ?\DateTimeImmutable $expiresAt = null,
+    ): CreatePatResult {
+        $user = $this->requireUser($usrId);
+        if ($user->status === Status::Revoked) {
+            throw new PreconditionException("Cannot create PAT for revoked user", 'user_revoked');
+        }
+        $nameLen = mb_strlen($name, 'UTF-8');
+        if ($nameLen < 1 || $nameLen > 120) {
+            throw new PreconditionException('name must be 1-120 code units', 'invalid_name');
+        }
+        $now = $this->now();
+        if ($expiresAt !== null) {
+            if ($expiresAt <= $now) {
+                throw new PreconditionException('expires_at must be in the future', 'expires_in_past');
+            }
+            $maxExpiry = $now->modify('+' . Pat::MAX_LIFETIME_SECONDS . ' seconds');
+            if ($expiresAt > $maxExpiry) {
+                throw new PreconditionException('expires_at exceeds 365-day cap', 'expires_too_late');
+            }
+        }
+        $patId = Id::generate('pat');
+        $secretBytes = random_bytes(32);
+        $secret = rtrim(strtr(base64_encode($secretBytes), '+/', '-_'), '=');
+        $hash = PasswordHashing::hash($secret);
+        $token = $patId . '_' . $secret;
+        $pat = new PersonalAccessToken(
+            id: $patId,
+            usrId: $usrId,
+            name: $name,
+            scope: array_values($scope),
+            status: PatStatus::Active,
+            expiresAt: $expiresAt,
+            lastUsedAt: null,
+            revokedAt: null,
+            createdAt: $now,
+            updatedAt: $now,
+        );
+        $this->pats[$patId] = $pat;
+        $this->patSecretHashes[$patId] = $hash;
+        return new CreatePatResult(pat: $pat, token: $token);
+    }
+
+    public function getPat(string $patId): PersonalAccessToken
+    {
+        $pat = $this->pats[$patId] ?? throw new NotFoundException("PAT {$patId} not found");
+        return $this->derivePatStatus($pat);
+    }
+
+    public function listPatsForUser(string $usrId, ?string $cursor = null, int $limit = 50): Page
+    {
+        $this->requireUser($usrId);
+        $limit = max(1, min($limit, 200));
+        $now = $this->now();
+        $results = [];
+        $pastCursor = $cursor === null;
+        foreach ($this->pats as $patId => $pat) {
+            if ($pat->usrId !== $usrId) continue;
+            if (!$pastCursor) {
+                if ($patId === $cursor) $pastCursor = true;
+                continue;
+            }
+            $results[] = $this->derivePatStatus($pat, $now);
+            if (count($results) >= $limit + 1) break;
+        }
+        $nextCursor = null;
+        if (count($results) > $limit) {
+            array_pop($results);
+            $nextCursor = $results[count($results) - 1]->id;
+        }
+        return new Page(data: $results, nextCursor: $nextCursor);
+    }
+
+    public function verifyPatToken(string $token): VerifiedPat
+    {
+        if (!Pat::isStructurallyValid($token)) {
+            // Burn time to prevent timing oracle (ADR 0016 §"Verification semantics").
+            PasswordHashing::verify(Pat::DUMMY_PHC_HASH, $token);
+            throw new InvalidPatTokenException();
+        }
+        // Split on second underscore: pat_<32hex>_<secret>
+        $parts = explode('_', $token, 3);
+        if (count($parts) !== 3) {
+            PasswordHashing::verify(Pat::DUMMY_PHC_HASH, $token);
+            throw new InvalidPatTokenException();
+        }
+        $secret = $parts[2];
+        if (strlen($secret) > Pat::MAX_SECRET_LENGTH) {
+            PasswordHashing::verify(Pat::DUMMY_PHC_HASH, '');
+            throw new InvalidPatTokenException();
+        }
+        $patId = $parts[0] . '_' . $parts[1];
+        $pat = $this->pats[$patId] ?? null;
+        if ($pat === null) {
+            PasswordHashing::verify(Pat::DUMMY_PHC_HASH, $secret);
+            throw new InvalidPatTokenException();
+        }
+        // Step 4: revoked check BEFORE Argon2id (timing: constant either way).
+        if ($pat->revokedAt !== null) {
+            PasswordHashing::verify(Pat::DUMMY_PHC_HASH, $secret);
+            throw new PatRevokedException($patId);
+        }
+        $now = $this->now();
+        // Step 5: expiry check.
+        if ($pat->expiresAt !== null && $now >= $pat->expiresAt) {
+            PasswordHashing::verify(Pat::DUMMY_PHC_HASH, $secret);
+            throw new PatExpiredException($patId);
+        }
+        // Step 6: Argon2id verify.
+        $hash = $this->patSecretHashes[$patId] ?? Pat::DUMMY_PHC_HASH;
+        if (!PasswordHashing::verify($hash, $secret)) {
+            throw new InvalidPatTokenException();
+        }
+        // Step 7: update last_used_at (best-effort; in-memory never fails).
+        $this->pats[$patId] = new PersonalAccessToken(
+            id: $pat->id,
+            usrId: $pat->usrId,
+            name: $pat->name,
+            scope: $pat->scope,
+            status: PatStatus::Active,
+            expiresAt: $pat->expiresAt,
+            lastUsedAt: $now,
+            revokedAt: null,
+            createdAt: $pat->createdAt,
+            updatedAt: $pat->updatedAt,
+        );
+        return new VerifiedPat(patId: $patId, usrId: $pat->usrId, scope: $pat->scope);
+    }
+
+    public function revokePat(string $patId): PersonalAccessToken
+    {
+        $pat = $this->pats[$patId] ?? throw new NotFoundException("PAT {$patId} not found");
+        $now = $this->now();
+        $updated = new PersonalAccessToken(
+            id: $pat->id,
+            usrId: $pat->usrId,
+            name: $pat->name,
+            scope: $pat->scope,
+            status: PatStatus::Revoked,
+            expiresAt: $pat->expiresAt,
+            lastUsedAt: $pat->lastUsedAt,
+            revokedAt: $pat->revokedAt ?? $now,
+            createdAt: $pat->createdAt,
+            updatedAt: $now,
+        );
+        $this->pats[$patId] = $updated;
+        return $updated;
+    }
+
+    private function derivePatStatus(
+        PersonalAccessToken $pat,
+        ?\DateTimeImmutable $now = null,
+    ): PersonalAccessToken {
+        if ($pat->revokedAt !== null) {
+            $status = PatStatus::Revoked;
+        } elseif ($pat->expiresAt !== null && ($now ?? $this->now()) >= $pat->expiresAt) {
+            $status = PatStatus::Expired;
+        } else {
+            $status = PatStatus::Active;
+        }
+        if ($status === $pat->status) return $pat;
+        return new PersonalAccessToken(
+            id: $pat->id,
+            usrId: $pat->usrId,
+            name: $pat->name,
+            scope: $pat->scope,
+            status: $status,
+            expiresAt: $pat->expiresAt,
+            lastUsedAt: $pat->lastUsedAt,
+            revokedAt: $pat->revokedAt,
+            createdAt: $pat->createdAt,
+            updatedAt: $pat->updatedAt,
+        );
     }
 
     /** Inline RFC 4648 base32 — matches the Python SDK's otpauth URI. */
