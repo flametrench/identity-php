@@ -12,8 +12,11 @@ use Flametrench\Identity\Exceptions\CredentialNotActiveException;
 use Flametrench\Identity\Exceptions\CredentialTypeMismatchException;
 use Flametrench\Identity\Exceptions\DuplicateCredentialException;
 use Flametrench\Identity\Exceptions\InvalidCredentialException;
+use Flametrench\Identity\Exceptions\InvalidPatTokenException;
 use Flametrench\Identity\Exceptions\InvalidTokenException;
 use Flametrench\Identity\Exceptions\NotFoundException;
+use Flametrench\Identity\Exceptions\PatExpiredException;
+use Flametrench\Identity\Exceptions\PatRevokedException;
 use Flametrench\Identity\Exceptions\PreconditionException;
 use Flametrench\Identity\Exceptions\SessionExpiredException;
 use Flametrench\Identity\Mfa\FactorStatus;
@@ -650,6 +653,12 @@ final class PostgresIdentityStore implements IdentityStore
             $stmt->execute([$uuid]);
             $stmt = $this->pdo->prepare(
                 'UPDATE ses SET revoked_at = ?
+                 WHERE usr_id = ? AND revoked_at IS NULL'
+            );
+            $stmt->execute([$now, $uuid]);
+            // Cascade: revoke active PATs owned by this user (ADR 0016).
+            $stmt = $this->pdo->prepare(
+                'UPDATE pat SET revoked_at = COALESCE(revoked_at, ?)
                  WHERE usr_id = ? AND revoked_at IS NULL'
             );
             $stmt->execute([$now, $uuid]);
@@ -1751,6 +1760,197 @@ final class PostgresIdentityStore implements IdentityStore
         /** @var array<string, mixed> $row */
         $row = $stmt->fetch(PDO::FETCH_ASSOC);
         return self::rowToPolicy($row);
+    }
+
+    // ─── v0.3 PATs (ADR 0016) ───
+
+    private const PAT_COLS = 'id, usr_id, name, scope, expires_at, last_used_at, revoked_at, created_at, updated_at';
+
+    /** @param array<string, mixed> $r */
+    private function rowToPat(array $r): PersonalAccessToken
+    {
+        $id = Id::encode('pat', (string) $r['id']);
+        $usrId = Id::encode('usr', (string) $r['usr_id']);
+        $expiresAt = $r['expires_at'] !== null ? new \DateTimeImmutable((string) $r['expires_at']) : null;
+        $lastUsedAt = $r['last_used_at'] !== null ? new \DateTimeImmutable((string) $r['last_used_at']) : null;
+        $revokedAt = $r['revoked_at'] !== null ? new \DateTimeImmutable((string) $r['revoked_at']) : null;
+        $scope = self::parsePgTextArray($r['scope']);
+        $status = $this->derivePatStatus($revokedAt, $expiresAt);
+        return new PersonalAccessToken(
+            id: $id,
+            usrId: $usrId,
+            name: (string) $r['name'],
+            scope: $scope,
+            status: $status,
+            expiresAt: $expiresAt,
+            lastUsedAt: $lastUsedAt,
+            revokedAt: $revokedAt,
+            createdAt: new \DateTimeImmutable((string) $r['created_at']),
+            updatedAt: new \DateTimeImmutable((string) $r['updated_at']),
+        );
+    }
+
+    private function derivePatStatus(?\DateTimeImmutable $revokedAt, ?\DateTimeImmutable $expiresAt): PatStatus
+    {
+        if ($revokedAt !== null) return PatStatus::Revoked;
+        if ($expiresAt !== null && $this->now() >= $expiresAt) return PatStatus::Expired;
+        return PatStatus::Active;
+    }
+
+    public function createPat(
+        string $usrId,
+        string $name,
+        array $scope = [],
+        ?\DateTimeImmutable $expiresAt = null,
+    ): CreatePatResult {
+        $userUuid = self::wireToUuid($usrId);
+        $nameLen = mb_strlen($name, 'UTF-8');
+        if ($nameLen < 1 || $nameLen > 120) {
+            throw new PreconditionException('name must be 1-120 code units', 'invalid_name');
+        }
+        $now = $this->now();
+        if ($expiresAt !== null) {
+            $maxExpiry = $now->modify('+' . Pat::MAX_LIFETIME_SECONDS . ' seconds');
+            if ($expiresAt > $maxExpiry) {
+                throw new PreconditionException('expires_at exceeds 365-day cap', 'expires_too_late');
+            }
+        }
+        $patId = Id::decode(Id::generate('pat'))['uuid'];
+        $patWire = Id::encode('pat', $patId);
+        $secretBytes = random_bytes(32);
+        $secret = rtrim(strtr(base64_encode($secretBytes), '+/', '-_'), '=');
+        $hash = PasswordHashing::hash($secret);
+        $token = $patWire . '_' . $secret;
+        $scopeStr = self::encodePgTextArray(array_values($scope));
+        $stmt = $this->pdo->prepare(
+            'INSERT INTO pat (id, usr_id, name, scope, secret_hash, expires_at)
+             VALUES (?, ?, ?, ?, ?, ?)
+             RETURNING ' . self::PAT_COLS
+        );
+        $stmt->execute([
+            $patId, $userUuid, $name, $scopeStr, $hash,
+            $expiresAt !== null ? self::fmt($expiresAt) : null,
+        ]);
+        /** @var array<string, mixed> $row */
+        $row = $stmt->fetch(PDO::FETCH_ASSOC);
+        $pat = $this->rowToPat($row);
+        return new CreatePatResult(pat: $pat, token: $token);
+    }
+
+    public function getPat(string $patId): PersonalAccessToken
+    {
+        $stmt = $this->pdo->prepare(
+            'SELECT ' . self::PAT_COLS . ' FROM pat WHERE id = ?'
+        );
+        $stmt->execute([self::wireToUuid($patId)]);
+        $row = $stmt->fetch(PDO::FETCH_ASSOC);
+        if ($row === false) {
+            throw new NotFoundException("PAT {$patId} not found");
+        }
+        return $this->rowToPat($row);
+    }
+
+    public function listPatsForUser(string $usrId, ?string $cursor = null, int $limit = 50): Page
+    {
+        $limit = max(1, min($limit, 200));
+        $params = [self::wireToUuid($usrId)];
+        $sql = 'SELECT ' . self::PAT_COLS . ' FROM pat WHERE usr_id = ?';
+        if ($cursor !== null) {
+            $sql .= ' AND id > ?';
+            $params[] = self::wireToUuid($cursor);
+        }
+        $sql .= ' ORDER BY id LIMIT ?';
+        $params[] = $limit + 1;
+        $stmt = $this->pdo->prepare($sql);
+        $stmt->execute($params);
+        $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
+        $page = array_slice($rows, 0, $limit);
+        $pats = array_map($this->rowToPat(...), $page);
+        $next = count($rows) > $limit && count($pats) > 0
+            ? $pats[count($pats) - 1]->id
+            : null;
+        return new Page(data: $pats, nextCursor: $next);
+    }
+
+    public function verifyPatToken(string $token): VerifiedPat
+    {
+        if (!Pat::isStructurallyValid($token)) {
+            PasswordHashing::verify(Pat::DUMMY_PHC_HASH, $token);
+            throw new InvalidPatTokenException();
+        }
+        $parts = explode('_', $token, 3);
+        if (count($parts) !== 3) {
+            PasswordHashing::verify(Pat::DUMMY_PHC_HASH, $token);
+            throw new InvalidPatTokenException();
+        }
+        $secret = $parts[2];
+        if (strlen($secret) > Pat::MAX_SECRET_LENGTH) {
+            PasswordHashing::verify(Pat::DUMMY_PHC_HASH, '');
+            throw new InvalidPatTokenException();
+        }
+        $patWire = $parts[0] . '_' . $parts[1];
+        try {
+            $patUuid = self::wireToUuid($patWire);
+        } catch (\Throwable) {
+            PasswordHashing::verify(Pat::DUMMY_PHC_HASH, $secret);
+            throw new InvalidPatTokenException();
+        }
+        $stmt = $this->pdo->prepare(
+            'SELECT usr_id, secret_hash, expires_at, revoked_at, scope FROM pat WHERE id = ?'
+        );
+        $stmt->execute([$patUuid]);
+        $row = $stmt->fetch(PDO::FETCH_ASSOC);
+        if ($row === false) {
+            PasswordHashing::verify(Pat::DUMMY_PHC_HASH, $secret);
+            throw new InvalidPatTokenException();
+        }
+        $revokedAt = $row['revoked_at'] !== null ? new \DateTimeImmutable((string) $row['revoked_at']) : null;
+        if ($revokedAt !== null) {
+            PasswordHashing::verify(Pat::DUMMY_PHC_HASH, $secret);
+            throw new PatRevokedException($patWire);
+        }
+        $expiresAt = $row['expires_at'] !== null ? new \DateTimeImmutable((string) $row['expires_at']) : null;
+        if ($expiresAt !== null && $this->now() >= $expiresAt) {
+            PasswordHashing::verify(Pat::DUMMY_PHC_HASH, $secret);
+            throw new PatExpiredException($patWire);
+        }
+        $hash = (string) $row['secret_hash'];
+        if (!PasswordHashing::verify($hash, $secret)) {
+            throw new InvalidPatTokenException();
+        }
+        // Best-effort last_used_at update (coalesced; discard errors per spec).
+        try {
+            $now = self::fmt($this->now());
+            $threshold = $this->now()->modify('-60 seconds');
+            $upd = $this->pdo->prepare(
+                'UPDATE pat SET last_used_at = ?
+                 WHERE id = ? AND revoked_at IS NULL
+                   AND (last_used_at IS NULL OR last_used_at < ?)'
+            );
+            $upd->execute([$now, $patUuid, self::fmt($threshold)]);
+        } catch (\Throwable) {
+            // best-effort
+        }
+        $usrId = Id::encode('usr', (string) $row['usr_id']);
+        $scope = self::parsePgTextArray($row['scope']);
+        return new VerifiedPat(patId: $patWire, usrId: $usrId, scope: $scope);
+    }
+
+    public function revokePat(string $patId): PersonalAccessToken
+    {
+        $uuid = self::wireToUuid($patId);
+        $stmt = $this->pdo->prepare(
+            'UPDATE pat SET revoked_at = COALESCE(revoked_at, ?), updated_at = ?
+             WHERE id = ?
+             RETURNING ' . self::PAT_COLS
+        );
+        $now = self::fmt($this->now());
+        $stmt->execute([$now, $now, $uuid]);
+        $row = $stmt->fetch(PDO::FETCH_ASSOC);
+        if ($row === false) {
+            throw new NotFoundException("PAT {$patId} not found");
+        }
+        return $this->rowToPat($row);
     }
 
     /**
