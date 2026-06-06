@@ -20,6 +20,11 @@ describe('Pat::isStructurallyValid', function () {
         'pat_0190f2a81b3c7abc8123456789abcdef_x',
         'pat_0190f2a81b3c7abc8123456789abcdef_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789-_aBcDe',
         'pat_ffffffffffffffffffffffffffffffff_kJ8XVqW3pYf7N2bL9Q-D5FxR8aTcM1eZ',
+        // ADR 0023 #1: parse at the SECOND underscore; secret may contain `_` and `-`.
+        'pat_0190f2a81b3c7abc8123456789abcdef_aB-cD_eF-gH_jK-mN',
+        // ADR 0023 constant #3: structural check is pure wire-format — no length cap.
+        // A 257-char secret MUST return true (length cap is verify-time only, inside verifyPatToken).
+        'pat_0190f2a81b3c7abc8123456789abcdef_' . str_repeat('A', 257),
     ];
     $invalid = [
         '',

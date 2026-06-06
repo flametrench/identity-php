@@ -211,6 +211,20 @@ describe('password credentials', function () {
             ->toThrow(InvalidCredentialException::class);
     });
 
+    it('verifyPassword unknown-identifier path burns dummy Argon2id (ADR 0023 timing oracle defense)', function () {
+        // The missing-credential path MUST run PasswordHashing::verify against
+        // the dummy PHC hash so latency is indistinguishable from a wrong-password hit.
+        // Argon2id at spec floor (m=19456, t=2, p=1) cannot complete in under 5ms on any
+        // real hardware — if the call returns in < 5ms the dummy verify was skipped.
+        $start = hrtime(true);
+        try {
+            $this->store->verifyPassword('nobody@x', 'testpw');
+        } catch (InvalidCredentialException) {
+        }
+        $elapsedMs = (hrtime(true) - $start) / 1_000_000;
+        expect($elapsedMs)->toBeGreaterThan(5.0);
+    });
+
     // ─── ADR 0008: usr_mfa_policy gate on verifyPassword ───
 
     it('verifyPassword: mfaRequired=false when no policy set', function () {

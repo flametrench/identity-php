@@ -585,10 +585,18 @@ final class InMemoryIdentityStore implements IdentityStore
     {
         $credId = $this->activeCredByIdentifier[$this->identifierKey(CredentialType::Password, $identifier)] ?? null;
         if ($credId === null) {
+            // Timing oracle defense (ADR 0023 / issue #2): unknown identifier must
+            // burn the same Argon2id wall-clock as a wrong-password hit.
+            PasswordHashing::verify(Pat::DUMMY_PHC_HASH, $password);
             throw new InvalidCredentialException('Invalid credential');
         }
         $hash = $this->passwordHashes[$credId] ?? null;
-        if ($hash === null || !password_verify($password, $hash)) {
+        if ($hash === null) {
+            // Hash missing — cover same as unknown identifier (ADR 0023 / issue #2).
+            PasswordHashing::verify(Pat::DUMMY_PHC_HASH, $password);
+            throw new InvalidCredentialException('Invalid credential');
+        }
+        if (!password_verify($password, $hash)) {
             throw new InvalidCredentialException('Invalid credential');
         }
         $cred = $this->requireCredential($credId);
