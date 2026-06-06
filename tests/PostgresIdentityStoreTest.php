@@ -95,6 +95,16 @@ it('verifyPassword rejects a wrong password', function () {
     $this->store->verifyPassword('alice@example.com', 'wrong');
 })->throws(InvalidCredentialException::class);
 
+it('verifyPassword unknown-identifier path burns dummy Argon2id (ADR 0023 timing oracle defense)', function () {
+    $start = hrtime(true);
+    try {
+        $this->store->verifyPassword('nobody@example.com', 'testpw');
+    } catch (InvalidCredentialException) {
+    }
+    $elapsedMs = (hrtime(true) - $start) / 1_000_000;
+    expect($elapsedMs)->toBeGreaterThan(5.0);
+});
+
 it('rejects a duplicate active credential on the same (type, identifier)', function () {
     $u = $this->store->createUser();
     $this->store->createPasswordCredential($u->id, 'alice@example.com', 'p1');

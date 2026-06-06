@@ -1066,6 +1066,9 @@ final class PostgresIdentityStore implements IdentityStore
         $stmt->execute([$identifier]);
         $row = $stmt->fetch(PDO::FETCH_ASSOC);
         if ($row === false || $row['password_hash'] === null) {
+            // Timing oracle defense (ADR 0023 / issue #2): unknown identifier must
+            // burn the same Argon2id wall-clock as a wrong-password hit.
+            PasswordHashing::verify(Pat::DUMMY_PHC_HASH, $password);
             throw new InvalidCredentialException('Invalid credential');
         }
         if (!PasswordHashing::verify((string) $row['password_hash'], $password)) {
