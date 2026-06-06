@@ -13,7 +13,9 @@
       "input": {
         "token": "pat_0190f2a81b3c7abc8123456789abcdef_x"
       },
-      "expected": { "result": true }
+      "expected": {
+        "result": true
+      }
     },
     {
       "id": "pat.token-format.well-formed-typical",
@@ -21,13 +23,19 @@
       "input": {
         "token": "pat_0190f2a81b3c7abc8123456789abcdef_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789-_aBcDe"
       },
-      "expected": { "result": true }
+      "expected": {
+        "result": true
+      }
     },
     {
       "id": "pat.token-format.rejects-empty-string",
       "description": "Empty bearer is structurally invalid.",
-      "input": { "token": "" },
-      "expected": { "result": false }
+      "input": {
+        "token": ""
+      },
+      "expected": {
+        "result": false
+      }
     },
     {
       "id": "pat.token-format.rejects-wrong-prefix",
@@ -35,7 +43,9 @@
       "input": {
         "token": "shr_0190f2a81b3c7abc8123456789abcdef_someSecretValue"
       },
-      "expected": { "result": false }
+      "expected": {
+        "result": false
+      }
     },
     {
       "id": "pat.token-format.rejects-no-prefix",
@@ -43,7 +53,9 @@
       "input": {
         "token": "0190f2a81b3c7abc8123456789abcdef_someSecretValue"
       },
-      "expected": { "result": false }
+      "expected": {
+        "result": false
+      }
     },
     {
       "id": "pat.token-format.rejects-uppercase-hex",
@@ -51,7 +63,9 @@
       "input": {
         "token": "pat_0190F2A81B3C7ABC8123456789ABCDEF_secret"
       },
-      "expected": { "result": false }
+      "expected": {
+        "result": false
+      }
     },
     {
       "id": "pat.token-format.rejects-short-id",
@@ -59,7 +73,9 @@
       "input": {
         "token": "pat_0190f2a81b3c_secret"
       },
-      "expected": { "result": false }
+      "expected": {
+        "result": false
+      }
     },
     {
       "id": "pat.token-format.rejects-long-id",
@@ -67,7 +83,9 @@
       "input": {
         "token": "pat_0190f2a81b3c7abc8123456789abcdef00_secret"
       },
-      "expected": { "result": false }
+      "expected": {
+        "result": false
+      }
     },
     {
       "id": "pat.token-format.rejects-missing-separator",
@@ -75,7 +93,9 @@
       "input": {
         "token": "pat_0190f2a81b3c7abc8123456789abcdefxsecret"
       },
-      "expected": { "result": false }
+      "expected": {
+        "result": false
+      }
     },
     {
       "id": "pat.token-format.rejects-empty-secret",
@@ -83,7 +103,9 @@
       "input": {
         "token": "pat_0190f2a81b3c7abc8123456789abcdef_"
       },
-      "expected": { "result": false }
+      "expected": {
+        "result": false
+      }
     },
     {
       "id": "pat.token-format.rejects-non-hex-id",
@@ -91,7 +113,19 @@
       "input": {
         "token": "pat_g190f2a81b3c7abc8123456789abcdef_secret"
       },
-      "expected": { "result": false }
+      "expected": {
+        "result": false
+      }
+    },
+    {
+      "id": "pat.token-format.secret-contains-underscore-parses-at-second-underscore",
+      "description": "Well-formed token whose base64url secret itself contains `_` and `-`. MUST be accepted: the parse boundary is the SECOND underscore (id = the 32 hex after `pat_`; secret = everything after). An SDK that splits on the LAST `_` mis-extracts a non-hex id segment (`...cdef_aB-cD`) and wrongly rejects this valid token — the parse-boundary divergence pinned in ADR 0023 #1 / docs/security.md.",
+      "input": {
+        "token": "pat_0190f2a81b3c7abc8123456789abcdef_aB-cD_eF-gH_jK-mN"
+      },
+      "expected": {
+        "result": true
+      }
     }
   ]
 }

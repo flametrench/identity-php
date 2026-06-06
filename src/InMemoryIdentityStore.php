@@ -591,7 +591,12 @@ final class InMemoryIdentityStore implements IdentityStore
             throw new InvalidCredentialException('Invalid credential');
         }
         $hash = $this->passwordHashes[$credId] ?? null;
-        if ($hash === null || !password_verify($password, $hash)) {
+        if ($hash === null) {
+            // Hash missing — cover same as unknown identifier (ADR 0023 / issue #2).
+            PasswordHashing::verify(Pat::DUMMY_PHC_HASH, $password);
+            throw new InvalidCredentialException('Invalid credential');
+        }
+        if (!password_verify($password, $hash)) {
             throw new InvalidCredentialException('Invalid credential');
         }
         $cred = $this->requireCredential($credId);
