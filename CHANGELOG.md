@@ -3,6 +3,19 @@
 All notable changes to `flametrench/identity` are recorded here.
 Spec-level changes live in [`spec/CHANGELOG.md`](https://github.com/flametrench/spec/blob/main/CHANGELOG.md).
 
+## [v0.3.1] — 2026-06-06
+
+### Fixed (security)
+- **Timing oracle in `verifyPassword` (GHSA-xxxx-xxxx-xxxx):** The method did not use a dummy Argon2id hash when credential lookups failed, allowing attackers to determine user existence through timing analysis. The vulnerability was introduced in v0.0.1 and affected all releases prior to v0.3.1. Adopters running any version `< 0.3.1` should upgrade immediately. See the advisory for details.
+
+## [v0.3.0] — 2026-06-05
+
+*This release contained a security vulnerability (timing oracle in `verifyPassword`). Do not use; upgrade to v0.3.1.*
+
+### Added
+- PostgreSQL-backed `IdentityStore` and Postgres schema migrations (matching spec v0.3.0 conformance)
+- [Additional v0.3.0 features documented in spec/CHANGELOG.md]
+
 ## [v0.2.0-rc.5] — 2026-04-27
 
 ### Fixed (security posture)
