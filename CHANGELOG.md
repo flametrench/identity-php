@@ -6,7 +6,7 @@ Spec-level changes live in [`spec/CHANGELOG.md`](https://github.com/flametrench/
 ## [v0.3.1] — 2026-06-06
 
 ### Fixed (security)
-- **Timing oracle in `verifyPassword` (GHSA-xxxx-xxxx-xxxx):** The method did not use a dummy Argon2id hash when credential lookups failed, allowing attackers to determine user existence through timing analysis. The vulnerability was introduced in v0.0.1 and affected all releases prior to v0.3.1. Adopters running any version `< 0.3.1` should upgrade immediately. See the advisory for details.
+- **Timing oracle in `verifyPassword` (GHSA-33cx-f9xx-h6ff):** The method did not use a dummy Argon2id hash when credential lookups failed, allowing attackers to determine user existence through timing analysis. The vulnerability was introduced in v0.0.1 and affected all releases prior to v0.3.1. Adopters running any version `< 0.3.1` should upgrade immediately. See [GHSA-33cx-f9xx-h6ff](https://github.com/flametrench/identity-php/security/advisories/GHSA-33cx-f9xx-h6ff) for details.
 
 ## [v0.3.0] — 2026-06-05
 
